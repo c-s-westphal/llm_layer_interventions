@@ -45,6 +45,11 @@ def main():
     output_dir = Path(config.get("output_dir", "outputs"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create subdirectories
+    (output_dir / "csv").mkdir(exist_ok=True)
+    (output_dir / "plots").mkdir(exist_ok=True)
+    (output_dir / "snippets").mkdir(exist_ok=True)
+
     logger = setup_logging(
         log_file=str(output_dir / "experiment.log")
     )
