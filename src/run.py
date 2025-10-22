@@ -499,7 +499,15 @@ def aggregate_by_layer(per_feature_df: pd.DataFrame) -> pd.DataFrame:
     summary = grouped.agg(agg_dict).reset_index()
 
     # Flatten column names
-    summary.columns = ["_".join(col).strip("_") for col in summary.columns.values]
+    # Swap order to match report expectations: "mean_d_loss" not "d_loss_mean"
+    new_columns = []
+    for col in summary.columns.values:
+        if isinstance(col, tuple) and len(col) == 2:
+            # Swap order: (metric, agg) -> (agg, metric)
+            new_columns.append(f"{col[1]}_{col[0]}")
+        else:
+            new_columns.append(str(col))
+    summary.columns = new_columns
 
     return summary
 
