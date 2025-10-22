@@ -1,0 +1,35 @@
+# Default configuration for SAE intervention experiments
+
+# Model configuration
+model_name: "gpt2-small"
+sae_release: "gpt2-small-res-jb"
+hook: "resid_post"
+layers: "0-11"  # Can be "0-11" or comma-separated like "0,3,6,9"
+
+# Intervention parameters
+alpha: 2.0
+alpha_sweep: [0, 0.5, 1, 2, 4]  # Set to null to disable sweep
+live_percentile: 90  # P90 threshold for determining "live" positions
+
+# Corpus configuration
+corpus_name: "wikitext2"  # Currently only wikitext2 supported
+max_passages: 200  # Number of passages to use
+max_len: 256  # Maximum token length per passage
+calibration_passages: 50  # Passages for calibration pass
+
+# Feature selection
+feature_source: "csv"  # Options: "csv", "neuronpedia_api", "static"
+neuronpedia_token: null  # Set via CLI or env var if using API
+min_conf: 0.0  # Minimum label confidence (0.0 to allow <0.7 features)
+top_k: 5  # Number of features to select per layer
+
+# Computation settings
+device: "auto"  # "auto", "cuda", "cpu"
+batch_size: 16  # Initial batch size (will auto-reduce on OOM)
+seed: 1234
+
+# Output configuration
+output_dir: "outputs"
+save_snippets: true
+snippet_window: 20  # Tokens before/after for snippet extraction
+num_snippet_examples: 5  # Top/bottom KL examples per feature
