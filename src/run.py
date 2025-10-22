@@ -502,9 +502,16 @@ def aggregate_by_layer(per_feature_df: pd.DataFrame) -> pd.DataFrame:
     # Swap order to match report expectations: "mean_d_loss" not "d_loss_mean"
     new_columns = []
     for col in summary.columns.values:
-        if isinstance(col, tuple) and len(col) == 2:
-            # Swap order: (metric, agg) -> (agg, metric)
-            new_columns.append(f"{col[1]}_{col[0]}")
+        if isinstance(col, tuple):
+            if len(col) == 2:
+                # Handle groupby columns like ('layer', '') or ('alpha', '')
+                if col[1] == '':
+                    new_columns.append(col[0])
+                else:
+                    # Swap order: (metric, agg) -> (agg, metric)
+                    new_columns.append(f"{col[1]}_{col[0]}")
+            else:
+                new_columns.append('_'.join(str(c) for c in col if c))
         else:
             new_columns.append(str(col))
     summary.columns = new_columns
