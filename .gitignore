@@ -44,16 +44,19 @@ venv.bak/
 
 # Outputs
 outputs/
-*.csv
-*.png
-*.jpg
-*.jsonl
+outputs/**/*.csv
+outputs/**/*.png
+outputs/**/*.jpg
+outputs/**/*.jsonl
 *.log
 
 # Data
 data/cache/
 data/*.pt
 data/*.pth
+
+# Allow CSV files in data/ directory
+!data/*.csv
 
 # Model caches
 .cache/
