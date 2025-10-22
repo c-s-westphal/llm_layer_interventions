@@ -155,6 +155,7 @@ def main():
     intervention_manager = FeatureIntervention(
         model=model,
         saes=saes,
+        hook=config.get("hook", "resid_pre"),
         live_percentile=config.get("live_percentile", 90),
         logger=logger
     )
@@ -369,7 +370,7 @@ def run_single_intervention(
     all_stats = []
     all_snippets = []
 
-    hook_name = f"blocks.{layer}.hook_resid_post"
+    hook_name = f"blocks.{layer}.hook_{intervention_manager.hook}"
 
     for batch_idx, batch_tokens in enumerate(batches):
         # Collate batch

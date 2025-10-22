@@ -3,7 +3,7 @@
 # Model configuration
 model_name: "gpt2-small"
 sae_release: "gpt2-small-res-jb"
-hook: "resid_post"
+hook: "resid_pre"  # gpt2-small-res-jb uses hook_resid_pre (not resid_post)
 layers: "0-11"  # Can be "0-11" or comma-separated like "0,3,6,9"
 
 # Intervention parameters

@@ -17,6 +17,7 @@ class FeatureIntervention:
         self,
         model: HookedTransformer,
         saes: Dict[int, SAE],
+        hook: str = "resid_pre",
         live_percentile: float = 90.0,
         logger: logging.Logger = None
     ):
@@ -25,11 +26,13 @@ class FeatureIntervention:
         Args:
             model: HookedTransformer model
             saes: Dictionary mapping layer index to SAE
+            hook: Hook type ("resid_pre" or "resid_post")
             live_percentile: Percentile threshold for "live" features (default: 90)
             logger: Logger instance
         """
         self.model = model
         self.saes = saes
+        self.hook = hook
         self.live_percentile = live_percentile
         self.logger = logger or logging.getLogger("sae_interventions")
 
@@ -78,7 +81,7 @@ class FeatureIntervention:
 
             # Run model and get activations for all layers
             with torch.no_grad():
-                hook_names = [f"blocks.{layer}.hook_resid_post" for layer in selected_features.keys()]
+                hook_names = [f"blocks.{layer}.hook_{self.hook}" for layer in selected_features.keys()]
                 _, cache = self.model.run_with_cache(
                     batch_dict["input_ids"],
                     names_filter=hook_names
@@ -86,7 +89,7 @@ class FeatureIntervention:
 
                 # Extract feature activations
                 for layer in selected_features.keys():
-                    hook_name = f"blocks.{layer}.hook_resid_post"
+                    hook_name = f"blocks.{layer}.hook_{self.hook}"
                     acts = cache[hook_name]  # [batch, seq, d_model]
 
                     # Encode with SAE

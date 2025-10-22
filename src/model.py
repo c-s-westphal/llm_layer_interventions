@@ -70,8 +70,8 @@ class ModelLoader:
         for layer in self.layers:
             try:
                 # Construct hook point string
-                # SAE-Lens expects format like "blocks.{L}.resid_post"
-                hook_point = f"blocks.{layer}.{self.hook}"
+                # SAE-Lens expects format like "blocks.{L}.hook_resid_pre"
+                hook_point = f"blocks.{layer}.hook_{self.hook}"
 
                 self.logger.info(f"Loading SAE for layer {layer} (hook_point={hook_point})")
 
@@ -117,9 +117,9 @@ class ModelLoader:
             layer: Layer index
 
         Returns:
-            Hook point like "blocks.{layer}.resid_post"
+            Hook point like "blocks.{layer}.hook_resid_pre"
         """
-        return f"blocks.{layer}.{self.hook}"
+        return f"blocks.{layer}.hook_{self.hook}"
 
 
 def test_sae_reconstruction(
