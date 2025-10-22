@@ -95,10 +95,20 @@ def log_environment_info(logger: logging.Logger) -> Dict[str, Any]:
     except (ImportError, AttributeError):
         sae_lens_version = "unknown"
 
+    try:
+        transformer_lens_version = transformer_lens.__version__
+    except AttributeError:
+        # transformer_lens doesn't always have __version__
+        try:
+            import importlib.metadata
+            transformer_lens_version = importlib.metadata.version("transformer_lens")
+        except Exception:
+            transformer_lens_version = "unknown"
+
     env_info = {
         "python_version": platform.python_version(),
         "torch_version": torch.__version__,
-        "transformer_lens_version": transformer_lens.__version__,
+        "transformer_lens_version": transformer_lens_version,
         "sae_lens_version": sae_lens_version,
         "cuda_available": torch.cuda.is_available(),
         "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
