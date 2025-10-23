@@ -18,7 +18,7 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from src.data import load_corpus
+from src.data import CorpusLoader, collate_batch
 from src.intervene import FeatureIntervention
 from src.model import ModelLoader
 
@@ -35,8 +35,8 @@ with open("configs/default.yaml", "r") as f:
 
 # Override config for this analysis
 config["layers"] = list(range(12))  # All layers
-config["num_calibration_passages"] = 200  # Enough to get good statistics
-config["num_test_passages"] = 500  # Test on reasonable corpus size
+config["calibration_passages"] = 200  # Enough to get good statistics
+config["test_passages"] = 500  # Test on reasonable corpus size
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
@@ -63,17 +63,20 @@ logger.info(f"Loaded model and {len(saes)} SAEs")
 # ============================================================================
 # Step 2: Load calibration corpus and find top 5 features per layer
 # ============================================================================
-logger.info("Step 2: Finding top 5 most active features per layer...")
+logger.info("Step 2: Loading calibration corpus...")
 
-calibration_data = load_corpus(
-    dataset_name=config["corpus"]["name"],
-    split=config["corpus"]["split"],
-    num_passages=config["num_calibration_passages"],
-    min_length=config["corpus"]["min_length"],
-    max_length=config["corpus"]["max_length"],
-    model=model,
+corpus_loader = CorpusLoader(
+    corpus_name=config["corpus_name"],
+    max_passages=config["calibration_passages"],
+    max_len=config["max_len"],
+    tokenizer=model.tokenizer,
     logger=logger
 )
+
+calibration_data, _ = corpus_loader.load_and_tokenize()
+logger.info(f"Loaded {len(calibration_data)} calibration passages")
+
+logger.info("Finding top 5 most active features per layer...")
 
 top_features_per_layer = {}  # {layer: [(feat_id, mean_activation), ...]}
 
@@ -91,7 +94,6 @@ for layer in tqdm(config["layers"], desc="Finding top features"):
         batch_tokens = calibration_data[batch_start:batch_end]
 
         # Pad and collate
-        from src.data import collate_batch
         batch_dict = collate_batch(batch_tokens, device=device)
 
         # Get activations at this layer
@@ -142,15 +144,16 @@ for layer in tqdm(config["layers"], desc="Finding top features"):
 # ============================================================================
 logger.info("Step 3: Loading test corpus...")
 
-test_data = load_corpus(
-    dataset_name=config["corpus"]["name"],
-    split="test",
-    num_passages=config["num_test_passages"],
-    min_length=config["corpus"]["min_length"],
-    max_length=config["corpus"]["max_length"],
-    model=model,
+test_corpus_loader = CorpusLoader(
+    corpus_name=config["corpus_name"],
+    max_passages=config["test_passages"],
+    max_len=config["max_len"],
+    tokenizer=model.tokenizer,
     logger=logger
 )
+
+test_data, _ = test_corpus_loader.load_and_tokenize()
+logger.info(f"Loaded {len(test_data)} test passages")
 
 # ============================================================================
 # Step 4: Ablate top features and measure d_loss per layer
