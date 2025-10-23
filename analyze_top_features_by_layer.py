@@ -190,8 +190,14 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
         top_10_tokens = torch.topk(logits_contribution, k=10).indices.tolist()
         top_10_values = torch.topk(logits_contribution, k=10).values.tolist()
 
-        logger.info(f"  Top-10 PROMOTED tokens: {[model.tokenizer.decode([t]) for t in top_10_tokens]}")
+        logger.info(f"  Top-10 PROMOTED tokens (positive contribution): {[repr(model.tokenizer.decode([t])) for t in top_10_tokens]}")
         logger.info(f"  Their logit contributions: {[f'{v:.4f}' for v in top_10_values]}")
+
+        # Also get bottom 10 (most suppressed tokens - negative contribution)
+        bottom_10_tokens = torch.topk(logits_contribution, k=10, largest=False).indices.tolist()
+        bottom_10_values = torch.topk(logits_contribution, k=10, largest=False).values.tolist()
+        logger.info(f"  Bottom-10 SUPPRESSED tokens (negative contribution): {[repr(model.tokenizer.decode([t])) for t in bottom_10_tokens]}")
+        logger.info(f"  Their logit contributions: {[f'{v:.4f}' for v in bottom_10_values]}")
 
         # Create intervention manager
         intervention_manager = FeatureIntervention(
@@ -274,6 +280,21 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
                 relative_decrease = (clean_top10_probs - ablated_top10_probs) / (clean_top10_probs + 1e-10)  # [batch, seq-1]
                 relative_decrease_masked = relative_decrease[mask_2d]
                 top10_prob_decreases.extend(relative_decrease_masked.cpu().tolist())
+
+                # Debug: Print first batch, first position
+                if batch_idx == 0:
+                    b, p = 0, 0
+                    if mask_2d[b, p]:
+                        logger.info(f"    [DEBUG batch {batch_idx}, pos {p}]:")
+                        logger.info(f"      Clean top-10 avg prob: {clean_top10_probs[b, p].item():.6f}")
+                        logger.info(f"      Ablated top-10 avg prob: {ablated_top10_probs[b, p].item():.6f}")
+                        logger.info(f"      Relative change: {relative_decrease[b, p].item():.6f}")
+                        # Show individual token probs
+                        for i, tok_idx in enumerate(top_10_tokens[:3]):  # Just first 3
+                            tok_str = model.tokenizer.decode([tok_idx])
+                            clean_p = clean_probs[b, p, tok_idx].item()
+                            ablated_p = ablation_probs[b, p, tok_idx].item()
+                            logger.info(f"        Token {repr(tok_str)}: {clean_p:.6f} → {ablated_p:.6f}")
 
                 # Find max decrease in this batch for snippet
                 for b_idx in range(len(batch_tokens)):
