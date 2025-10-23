@@ -101,7 +101,7 @@ def find_top_tokens_by_probability(
     return top_tokens
 
 
-def get_max_activation(
+def get_mean_activation(
     model,
     sae,
     layer: int,
@@ -110,8 +110,8 @@ def get_max_activation(
     data: List[torch.Tensor],
     batch_size: int,
     logger: logging.Logger = None
-) -> float:
-    """Find maximum activation for a feature across calibration data.
+) -> Tuple[float, float]:
+    """Find mean and std activation for a feature across calibration data.
 
     Args:
         model: HookedTransformer model
@@ -124,12 +124,12 @@ def get_max_activation(
         logger: Logger instance
 
     Returns:
-        Maximum activation value
+        Tuple of (mean_activation, std_activation)
     """
     logger = logger or logging.getLogger("noise_intervention")
-    logger.info(f"Finding max activation for layer {layer}, feature {feature_id}...")
+    logger.info(f"Computing activation statistics for layer {layer}, feature {feature_id}...")
 
-    max_act = 0.0
+    all_activations = []
     hook_name = f"blocks.{layer}.hook_{hook}"
 
     num_batches = (len(data) + batch_size - 1) // batch_size
@@ -149,11 +149,15 @@ def get_max_activation(
             sae_acts = sae.encode(acts)
             feature_acts = sae_acts[:, :, feature_id]
 
-            batch_max = feature_acts.max().item()
-            max_act = max(max_act, batch_max)
+            all_activations.append(feature_acts.flatten().cpu())
 
-    logger.info(f"  Max activation: {max_act:.4f}")
-    return max_act
+    # Concatenate and compute statistics
+    all_acts = torch.cat(all_activations)
+    mean_act = all_acts.mean().item()
+    std_act = all_acts.std().item()
+
+    logger.info(f"  Mean activation: {mean_act:.4f}, Std: {std_act:.4f}")
+    return mean_act, std_act
 
 
 def compute_kl_divergence(
@@ -184,14 +188,14 @@ def compute_kl_divergence(
     return kl_mean.item()
 
 
-def create_noise_hook(sae, feature_id: int, noise_level: float, max_activation: float):
-    """Create a hook that adds uniform noise to a feature.
+def create_noise_hook(sae, feature_id: int, noise_level: float, mean_activation: float):
+    """Create a hook that adds Gaussian noise to a feature.
 
     Args:
         sae: SAE instance
         feature_id: Feature ID to add noise to
-        noise_level: Noise level (0 to 1, scaled by max_activation)
-        max_activation: Maximum activation value for scaling
+        noise_level: Noise standard deviation (scaled by mean_activation)
+        mean_activation: Mean activation value for scaling
 
     Returns:
         Hook function
@@ -200,8 +204,8 @@ def create_noise_hook(sae, feature_id: int, noise_level: float, max_activation: 
         # Encode to SAE latent space
         sae_acts = sae.encode(activations)  # [batch, seq, d_sae]
 
-        # Add uniform noise to feature
-        noise = torch.rand_like(sae_acts[:, :, feature_id]) * noise_level * max_activation
+        # Add Gaussian noise to feature (mean=0, std=noise_level*mean_activation)
+        noise = torch.randn_like(sae_acts[:, :, feature_id]) * noise_level * mean_activation
         sae_acts[:, :, feature_id] = sae_acts[:, :, feature_id] + noise
 
         # Decode back
@@ -219,11 +223,11 @@ def calibrate_noise_for_kld(
     feature_id: int,
     hook: str,
     data: List[torch.Tensor],
-    max_activation: float,
+    mean_activation: float,
     target_kld: float,
     batch_size: int,
     max_iterations: int = 20,
-    tolerance: float = 0.01,
+    tolerance: float = 0.1,
     logger: logging.Logger = None
 ) -> Tuple[float, float]:
     """Find noise level that achieves target KLD.
@@ -237,7 +241,7 @@ def calibrate_noise_for_kld(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        max_activation: Maximum activation for scaling
+        mean_activation: Mean activation for scaling Gaussian noise
         target_kld: Target KLD value
         batch_size: Batch size
         max_iterations: Maximum search iterations
@@ -250,9 +254,9 @@ def calibrate_noise_for_kld(
     logger = logger or logging.getLogger("noise_intervention")
     hook_name = f"blocks.{layer}.hook_{hook}"
 
-    # Binary search bounds
+    # Binary search bounds (noise_level is std multiplier)
     noise_low = 0.0
-    noise_high = 1.0
+    noise_high = 10.0  # Allow up to 10x mean_activation as std
 
     logger.info(f"Calibrating noise for layer {layer}, feature {feature_id} (target KLD={target_kld})...")
 
@@ -269,7 +273,7 @@ def calibrate_noise_for_kld(
             clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
 
         # Noisy run
-        noise_hook = create_noise_hook(sae, feature_id, noise_level, max_activation)
+        noise_hook = create_noise_hook(sae, feature_id, noise_level, mean_activation)
 
         with torch.no_grad():
             noisy_logits = model.run_with_hooks(
@@ -309,8 +313,9 @@ def measure_probability_changes(
     data: List[torch.Tensor],
     top_tokens: List[int],
     noise_level: float,
-    max_activation: float,
+    mean_activation: float,
     batch_size: int,
+    tokenizer,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
     """Measure probability changes on top tokens at given noise level.
@@ -324,14 +329,23 @@ def measure_probability_changes(
         data: List of token tensors
         top_tokens: List of important token IDs
         noise_level: Calibrated noise level
-        max_activation: Maximum activation
+        mean_activation: Mean activation
         batch_size: Batch size
+        tokenizer: Tokenizer for logging
         logger: Logger instance
 
     Returns:
         Dictionary with statistics (mean, median, etc.)
     """
     logger = logger or logging.getLogger("noise_intervention")
+    logger.info(f"  Measuring probability changes on top-10 tokens...")
+
+    # Log which tokens we're analyzing
+    logger.info(f"  Analyzing probability changes for tokens:")
+    for i, token_id in enumerate(top_tokens[:10]):
+        token_str = tokenizer.decode([token_id])
+        logger.info(f"    {i+1}. Token {token_id} ('{token_str}')")
+
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
 
@@ -351,7 +365,7 @@ def measure_probability_changes(
             clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
 
         # Noisy run
-        noise_hook = create_noise_hook(sae, feature_id, noise_level, max_activation)
+        noise_hook = create_noise_hook(sae, feature_id, noise_level, mean_activation)
 
         with torch.no_grad():
             noisy_logits = model.run_with_hooks(
@@ -386,7 +400,7 @@ def measure_probability_changes(
         "q75": float(np.percentile(all_changes, 75))
     }
 
-    logger.info(f"  Probability change statistics:")
+    logger.info(f"  Top-10 token probability change statistics:")
     logger.info(f"    Mean: {stats['mean']:.4f}")
     logger.info(f"    Median: {stats['median']:.4f}")
     logger.info(f"    Std: {stats['std']:.4f}")
@@ -398,7 +412,7 @@ def measure_probability_changes(
 def main():
     parser = argparse.ArgumentParser(description="Noise-based feature intervention with KLD targeting")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--target_kld", type=float, default=0.1, help="Target KLD threshold")
+    parser.add_argument("--target_kld", type=float, default=3.0, help="Target KLD threshold")
     parser.add_argument("--top_k_activation", type=int, default=5, help="Top K features by activation")
     parser.add_argument("--top_k_interpretability", type=int, default=5, help="Top K features by interpretability")
     args = parser.parse_args()
@@ -550,10 +564,10 @@ def main():
     logger.info("="*80)
 
     for (layer, feature_id), activation in top_by_activation:
-        logger.info(f"\n--- Layer {layer}, Feature {feature_id} (activation={activation:.4f}) ---")
+        logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Get max activation
-        max_act = get_max_activation(
+        # Get mean activation
+        mean_act, std_act = get_mean_activation(
             model, saes[layer], layer, feature_id, config["hook"],
             calibration_data, config["batch_size"], logger
         )
@@ -561,22 +575,23 @@ def main():
         # Calibrate noise
         noise_level, achieved_kld = calibrate_noise_for_kld(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, max_act, args.target_kld,
+            calibration_data, mean_act, args.target_kld,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_level, max_act,
-            config["batch_size"], logger
+            test_data, top_tokens, noise_level, mean_act,
+            config["batch_size"], model.tokenizer, logger
         )
 
         results.append({
             "layer": layer,
             "feature_id": feature_id,
             "selection_method": "activation",
-            "max_activation": max_act,
+            "mean_activation": mean_act,
+            "std_activation": std_act,
             "noise_level": noise_level,
             "achieved_kld": achieved_kld,
             **stats
@@ -594,8 +609,8 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Get max activation
-        max_act = get_max_activation(
+        # Get mean activation
+        mean_act, std_act = get_mean_activation(
             model, saes[layer], layer, feature_id, config["hook"],
             calibration_data, config["batch_size"], logger
         )
@@ -603,15 +618,15 @@ def main():
         # Calibrate noise
         noise_level, achieved_kld = calibrate_noise_for_kld(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, max_act, args.target_kld,
+            calibration_data, mean_act, args.target_kld,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_level, max_act,
-            config["batch_size"], logger
+            test_data, top_tokens, noise_level, mean_act,
+            config["batch_size"], model.tokenizer, logger
         )
 
         results.append({
@@ -620,7 +635,8 @@ def main():
             "selection_method": "interpretability",
             "label": label,
             "label_confidence": conf,
-            "max_activation": max_act,
+            "mean_activation": mean_act,
+            "std_activation": std_act,
             "noise_level": noise_level,
             "achieved_kld": achieved_kld,
             **stats
