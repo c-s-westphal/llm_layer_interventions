@@ -371,11 +371,113 @@ def measure_probability_changes(
         "q75": float(np.percentile(all_changes, 75))
     }
 
-    logger.info(f"  Top-10 token probability change statistics:")
+    logger.info(f"  Top-10 token probability change statistics (target feature):")
     logger.info(f"    Mean: {stats['mean']:.4f}")
     logger.info(f"    Median: {stats['median']:.4f}")
     logger.info(f"    Std: {stats['std']:.4f}")
     logger.info(f"    Range: [{stats['min']:.4f}, {stats['max']:.4f}]")
+
+    return stats
+
+
+def measure_probability_changes_random_control(
+    model,
+    sae,
+    layer: int,
+    feature_id: int,
+    hook: str,
+    data: List[torch.Tensor],
+    top_tokens: List[int],
+    noise_percentage: float,
+    batch_size: int,
+    tokenizer,
+    logger: logging.Logger = None
+) -> Dict[str, float]:
+    """Measure probability changes when adding noise to a RANDOM feature (control).
+
+    Args:
+        model: HookedTransformer model
+        sae: SAE instance
+        layer: Layer index
+        feature_id: Original feature ID (will select a different random one)
+        hook: Hook type
+        data: List of token tensors
+        top_tokens: Same top-10 tokens as target measurement
+        noise_percentage: Same noise percentage
+        batch_size: Batch size
+        tokenizer: Tokenizer for logging
+        logger: Logger instance
+
+    Returns:
+        Dictionary with statistics (mean, median, etc.)
+    """
+    logger = logger or logging.getLogger("noise_intervention")
+
+    # Select a random feature (different from the target)
+    d_sae = sae.cfg.d_sae
+    random_feature_id = np.random.randint(0, d_sae)
+    while random_feature_id == feature_id:
+        random_feature_id = np.random.randint(0, d_sae)
+
+    logger.info(f"  Measuring probability changes on RANDOM feature {random_feature_id} (control)...")
+
+    hook_name = f"blocks.{layer}.hook_{hook}"
+    top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
+
+    all_relative_changes = []
+
+    num_batches = (len(data) + batch_size - 1) // batch_size
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(data))
+        batch_tokens = data[batch_start:batch_end]
+        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+
+        # Clean run
+        with torch.no_grad():
+            clean_logits = model(batch_dict["input_ids"])
+            clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
+
+        # Noisy run on RANDOM feature
+        noise_hook = create_noise_hook(sae, random_feature_id, noise_percentage)
+
+        with torch.no_grad():
+            noisy_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, noise_hook)]
+            )
+            noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
+
+        # Extract probabilities for SAME top tokens
+        clean_top_probs = clean_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        noisy_top_probs = noisy_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+
+        # Compute relative change: (clean - noisy) / clean
+        mask = batch_dict["attention_mask"][:, 1:].bool()
+        relative_change = (clean_top_probs - noisy_top_probs) / (clean_top_probs + 1e-10)
+
+        # Collect valid positions
+        valid_changes = relative_change[mask].cpu().numpy()
+        all_relative_changes.append(valid_changes)
+
+    # Concatenate all changes
+    all_changes = np.concatenate(all_relative_changes)
+
+    # Compute statistics
+    stats = {
+        "mean": float(np.mean(all_changes)),
+        "median": float(np.median(all_changes)),
+        "std": float(np.std(all_changes)),
+        "min": float(np.min(all_changes)),
+        "max": float(np.max(all_changes)),
+        "q25": float(np.percentile(all_changes, 25)),
+        "q75": float(np.percentile(all_changes, 75))
+    }
+
+    logger.info(f"  Top-10 token probability change statistics (random feature {random_feature_id} control):")
+    logger.info(f"    Mean: {stats['mean']:.4f}")
+    logger.info(f"    Median: {stats['median']:.4f}")
 
     return stats
 
@@ -560,12 +662,22 @@ def main():
             config["batch_size"], logger=logger
         )
 
-        # Measure probability changes
+        # Measure probability changes on TARGET feature
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, top_tokens, args.noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
+
+        # Measure probability changes on RANDOM feature (control)
+        control_stats = measure_probability_changes_random_control(
+            model, saes[layer], layer, feature_id, config["hook"],
+            test_data, top_tokens, args.noise_percentage,
+            config["batch_size"], model.tokenizer, logger
+        )
+
+        # Prefix control stats
+        control_stats_prefixed = {f"control_{k}": v for k, v in control_stats.items()}
 
         results.append({
             "layer": layer,
@@ -574,7 +686,8 @@ def main():
             "max_activation": activation,
             "noise_percentage": args.noise_percentage,
             "kld": kld,
-            **stats
+            **stats,
+            **control_stats_prefixed
         })
 
     logger.info("\n" + "="*80)
@@ -596,12 +709,22 @@ def main():
             config["batch_size"], logger=logger
         )
 
-        # Measure probability changes
+        # Measure probability changes on TARGET feature
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, top_tokens, args.noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
+
+        # Measure probability changes on RANDOM feature (control)
+        control_stats = measure_probability_changes_random_control(
+            model, saes[layer], layer, feature_id, config["hook"],
+            test_data, top_tokens, args.noise_percentage,
+            config["batch_size"], model.tokenizer, logger
+        )
+
+        # Prefix control stats
+        control_stats_prefixed = {f"control_{k}": v for k, v in control_stats.items()}
 
         results.append({
             "layer": layer,
@@ -611,7 +734,8 @@ def main():
             "label_confidence": conf,
             "noise_percentage": args.noise_percentage,
             "kld": kld,
-            **stats
+            **stats,
+            **control_stats_prefixed
         })
 
     # Save results
@@ -626,14 +750,16 @@ def main():
     logger.info("="*80)
 
     logger.info("\nBy Selection Method:")
-    logger.info(f"  Activation (top {args.top_k_activation}):")
+    logger.info(f"  Activation (top {args.top_k_activation} per layer):")
     activation_results = results_df[results_df["selection_method"] == "activation"]
-    logger.info(f"    Mean median probability change: {activation_results['median'].mean():.4f}")
+    logger.info(f"    Mean of means: {activation_results['mean'].mean():.4f}")
+    logger.info(f"    Mean of medians: {activation_results['median'].mean():.4f}")
     logger.info(f"    Mean KLD: {activation_results['kld'].mean():.4f}")
 
-    logger.info(f"\n  Interpretability (top {args.top_k_interpretability}):")
+    logger.info(f"\n  Interpretability (top {args.top_k_interpretability} per layer):")
     interp_results = results_df[results_df["selection_method"] == "interpretability"]
-    logger.info(f"    Mean median probability change: {interp_results['median'].mean():.4f}")
+    logger.info(f"    Mean of means: {interp_results['mean'].mean():.4f}")
+    logger.info(f"    Mean of medians: {interp_results['median'].mean():.4f}")
     logger.info(f"    Mean KLD: {interp_results['kld'].mean():.4f}")
 
     logger.info("\nBy Layer and Feature Type:")
@@ -647,13 +773,14 @@ def main():
         ]
         if len(layer_activation) > 0:
             logger.info(
-                f"    Activation features (n={len(layer_activation)}): "
+                f"    Activation (n={len(layer_activation)}): "
+                f"mean_mean={layer_activation['mean'].mean():.4f}, "
                 f"mean_median={layer_activation['median'].mean():.4f}, "
-                f"median_median={layer_activation['median'].median():.4f}, "
-                f"mean_kld={layer_activation['kld'].mean():.4f}"
+                f"control_mean_mean={layer_activation['control_mean'].mean():.4f}, "
+                f"control_mean_median={layer_activation['control_median'].mean():.4f}"
             )
         else:
-            logger.info(f"    Activation features (n=0): none")
+            logger.info(f"    Activation (n=0): none")
 
         # Interpretability-based features
         layer_interp = results_df[
@@ -662,13 +789,14 @@ def main():
         ]
         if len(layer_interp) > 0:
             logger.info(
-                f"    Interpretability features (n={len(layer_interp)}): "
+                f"    Interpretability (n={len(layer_interp)}): "
+                f"mean_mean={layer_interp['mean'].mean():.4f}, "
                 f"mean_median={layer_interp['median'].mean():.4f}, "
-                f"median_median={layer_interp['median'].median():.4f}, "
-                f"mean_kld={layer_interp['kld'].mean():.4f}"
+                f"control_mean_mean={layer_interp['control_mean'].mean():.4f}, "
+                f"control_mean_median={layer_interp['control_median'].mean():.4f}"
             )
         else:
-            logger.info(f"    Interpretability features (n=0): none")
+            logger.info(f"    Interpretability (n=0): none")
 
     logger.info("\nDone!")
 
