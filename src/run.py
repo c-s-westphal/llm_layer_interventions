@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 from typing import Dict, List
 
+# Fix RunPod/HuggingFace Hub environment issue
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
+
 import pandas as pd
 import torch
 from tqdm import tqdm

@@ -6,6 +6,10 @@ This script tests:
 3. Are activations being modified correctly?
 """
 
+import os
+# Fix RunPod environment issue
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
+
 import torch
 from transformer_lens import HookedTransformer
 from sae_lens import SAE
