@@ -218,6 +218,27 @@ def create_noise_hook(sae, feature_id: int, noise_percentage: float):
     return hook_fn
 
 
+def create_reconstruction_hook(sae):
+    """Create a hook that just does SAE reconstruction (no noise).
+
+    Args:
+        sae: SAE instance
+
+    Returns:
+        Hook function
+    """
+    def hook_fn(activations, hook):
+        # Encode to SAE latent space
+        sae_acts = sae.encode(activations)  # [batch, seq, d_sae]
+
+        # Decode back (no noise added)
+        reconstructed_acts = sae.decode(sae_acts)
+
+        return reconstructed_acts
+
+    return hook_fn
+
+
 def measure_kld_with_noise(
     model,
     sae,
@@ -254,12 +275,17 @@ def measure_kld_with_noise(
     batch_tokens = data[:batch_size]
     batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-    # Clean run
-    with torch.no_grad():
-        clean_logits = model(batch_dict["input_ids"])
-        clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
+    # Baseline: SAE reconstruction without noise
+    reconstruction_hook = create_reconstruction_hook(sae)
 
-    # Noisy run
+    with torch.no_grad():
+        baseline_logits = model.run_with_hooks(
+            batch_dict["input_ids"],
+            fwd_hooks=[(hook_name, reconstruction_hook)]
+        )
+        baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+
+    # Noisy: SAE reconstruction WITH noise
     noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
 
     with torch.no_grad():
@@ -269,11 +295,11 @@ def measure_kld_with_noise(
         )
         noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
 
-    # Compute KLD
+    # Compute KLD (baseline vs noisy, not clean vs noisy)
     mask = batch_dict["attention_mask"][:, 1:]
-    kld = compute_kl_divergence(clean_probs, noisy_probs, mask)
+    kld = compute_kl_divergence(baseline_probs, noisy_probs, mask)
 
-    logger.info(f"  KLD with {noise_percentage*100:.1f}% noise: {kld:.4f}")
+    logger.info(f"  KLD (reconstructed baseline vs noisy): {kld:.4f}")
     return kld
 
 
@@ -330,12 +356,17 @@ def measure_probability_changes(
         batch_tokens = data[batch_start:batch_end]
         batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-        # Clean run
-        with torch.no_grad():
-            clean_logits = model(batch_dict["input_ids"])
-            clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
+        # Baseline: SAE reconstruction without noise
+        reconstruction_hook = create_reconstruction_hook(sae)
 
-        # Noisy run
+        with torch.no_grad():
+            baseline_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, reconstruction_hook)]
+            )
+            baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+
+        # Noisy: SAE reconstruction WITH noise on target feature
         noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
 
         with torch.no_grad():
@@ -346,12 +377,12 @@ def measure_probability_changes(
             noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
 
         # Extract probabilities for top tokens
-        clean_top_probs = clean_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
         noisy_top_probs = noisy_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
 
-        # Compute relative change: (clean - noisy) / clean
+        # Compute relative change: (baseline - noisy) / baseline
         mask = batch_dict["attention_mask"][:, 1:].bool()
-        relative_change = (clean_top_probs - noisy_top_probs) / (clean_top_probs + 1e-10)
+        relative_change = (baseline_top_probs - noisy_top_probs) / (baseline_top_probs + 1e-10)
 
         # Collect valid positions
         valid_changes = relative_change[mask].cpu().numpy()
@@ -434,12 +465,17 @@ def measure_probability_changes_random_control(
         batch_tokens = data[batch_start:batch_end]
         batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-        # Clean run
-        with torch.no_grad():
-            clean_logits = model(batch_dict["input_ids"])
-            clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
+        # Baseline: SAE reconstruction without noise
+        reconstruction_hook = create_reconstruction_hook(sae)
 
-        # Noisy run on RANDOM feature
+        with torch.no_grad():
+            baseline_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, reconstruction_hook)]
+            )
+            baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+
+        # Noisy: SAE reconstruction WITH noise on RANDOM feature
         noise_hook = create_noise_hook(sae, random_feature_id, noise_percentage)
 
         with torch.no_grad():
@@ -450,12 +486,12 @@ def measure_probability_changes_random_control(
             noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
 
         # Extract probabilities for SAME top tokens
-        clean_top_probs = clean_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
         noisy_top_probs = noisy_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
 
-        # Compute relative change: (clean - noisy) / clean
+        # Compute relative change: (baseline - noisy) / baseline
         mask = batch_dict["attention_mask"][:, 1:].bool()
-        relative_change = (clean_top_probs - noisy_top_probs) / (clean_top_probs + 1e-10)
+        relative_change = (baseline_top_probs - noisy_top_probs) / (baseline_top_probs + 1e-10)
 
         # Collect valid positions
         valid_changes = relative_change[mask].cpu().numpy()
