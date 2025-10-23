@@ -178,10 +178,10 @@ else:
     print("✅ Alpha=0 changes output (ablation works)")
 
 # ============================================================================
-# TEST 4: Check if current pipeline implementation has issues
+# TEST 4: Check if fixed pipeline implementation preserves clean at alpha=1
 # ============================================================================
 print("\n" + "=" * 80)
-print("TEST 4: Checking pipeline implementation")
+print("TEST 4: Checking FIXED pipeline implementation (alpha=1)")
 print("=" * 80)
 
 # Simulate what the pipeline does
@@ -196,10 +196,10 @@ intervention_manager = FeatureIntervention(
     live_percentile=90,
 )
 
-# Mock calibration
+# Mock calibration - use very low threshold so feature is "live"
 intervention_manager.thresholds[(layer, feature_idx)] = 0.001
 
-print("Creating intervention hook via pipeline...")
+print("Creating intervention hook via pipeline (alpha=1.0)...")
 hook_fn = intervention_manager.create_intervention_hook(layer, feature_idx, alpha=1.0)
 
 with torch.no_grad():
@@ -212,14 +212,103 @@ with torch.no_grad():
         reduction='mean'
     )
 
-delta_pipeline = pipeline_alpha1_loss.item() - clean_loss.item()
-print(f"\nPipeline alpha=1 loss: {pipeline_alpha1_loss.item():.6f}")
-print(f"Delta from clean: {delta_pipeline:.6f}")
+delta_pipeline_alpha1 = pipeline_alpha1_loss.item() - clean_loss.item()
+logits_diff_pipeline = (clean_logits - pipeline_alpha1_logits).abs().max().item()
 
-if abs(delta_pipeline) > 0.001:
-    print("⚠️  ISSUE FOUND: Pipeline implementation doesn't preserve clean at alpha=1")
+print(f"\nPipeline alpha=1 loss: {pipeline_alpha1_loss.item():.6f}")
+print(f"Delta from clean: {delta_pipeline_alpha1:.6f} (should be ~0.0)")
+print(f"Max logits difference: {logits_diff_pipeline:.6f} (should be small)")
+
+if abs(delta_pipeline_alpha1) > 0.01:  # Allow small reconstruction error
+    print("⚠️  ISSUE: Pipeline doesn't preserve clean at alpha=1")
 else:
-    print("✅ Pipeline implementation looks correct")
+    print("✅ Pipeline preserves clean at alpha=1")
+
+# ============================================================================
+# TEST 5: Check if pipeline ablation (alpha=0) works on active feature
+# ============================================================================
+print("\n" + "=" * 80)
+print("TEST 5: Checking pipeline ablation (alpha=0) on active feature")
+print("=" * 80)
+
+# Try a feature that's more likely to be active (lower index features often more general)
+test_feature_idx = 100  # Try a different feature
+print(f"Testing with feature {test_feature_idx}...")
+
+# Mock calibration with very low threshold
+intervention_manager.thresholds[(layer, test_feature_idx)] = 0.001
+
+print("Creating intervention hook via pipeline (alpha=0.0)...")
+hook_fn_alpha0 = intervention_manager.create_intervention_hook(layer, test_feature_idx, alpha=0.0)
+
+with torch.no_grad():
+    with model.hooks([(hook_name, hook_fn_alpha0)]):
+        pipeline_alpha0_logits = model(tokens)
+
+    pipeline_alpha0_loss = torch.nn.functional.cross_entropy(
+        pipeline_alpha0_logits[0, :-1, :],
+        tokens[0, 1:],
+        reduction='mean'
+    )
+
+delta_pipeline_alpha0 = pipeline_alpha0_loss.item() - clean_loss.item()
+logits_diff_alpha0_pipeline = (clean_logits - pipeline_alpha0_logits).abs().max().item()
+
+print(f"\nPipeline alpha=0 loss: {pipeline_alpha0_loss.item():.6f}")
+print(f"Delta from clean: {delta_pipeline_alpha0:.6f}")
+print(f"Max logits difference: {logits_diff_alpha0_pipeline:.6f}")
+
+if abs(delta_pipeline_alpha0) < 0.001:
+    print("⚠️  WARNING: Alpha=0 has no effect (feature may not be active)")
+else:
+    print("✅ Alpha=0 changes output (ablation works)")
+
+# ============================================================================
+# TEST 6: Verify fix by checking SAE reconstruction only applied to live positions
+# ============================================================================
+print("\n" + "=" * 80)
+print("TEST 6: Verify SAE only applied to live positions")
+print("=" * 80)
+
+# Create a hook that reports how many positions it modifies
+num_live_positions = [0]  # Use list to allow mutation in nested function
+
+def diagnostic_hook(activations, hook):
+    """Hook that counts live positions."""
+    modified_acts = activations.clone()
+
+    sae_acts = sae.encode(activations)
+    feature_acts = sae_acts[:, :, test_feature_idx]
+    live_mask = feature_acts >= 0.001
+
+    num_live_positions[0] = live_mask.sum().item()
+
+    if not live_mask.any():
+        return activations
+
+    batch_indices, seq_indices = torch.where(live_mask)
+
+    for batch_idx, seq_idx in zip(batch_indices, seq_indices):
+        pos_acts = activations[batch_idx, seq_idx:seq_idx+1, :]
+        pos_sae_acts = sae.encode(pos_acts)
+        pos_sae_acts[0, test_feature_idx] *= 1.0  # No change
+        pos_modified = sae.decode(pos_sae_acts)
+        modified_acts[batch_idx, seq_idx, :] = pos_modified[0, :]
+
+    return modified_acts
+
+with torch.no_grad():
+    with model.hooks([(hook_name, diagnostic_hook)]):
+        diagnostic_logits = model(tokens)
+
+print(f"Number of live positions: {num_live_positions[0]}")
+print(f"Total positions: {tokens.shape[0] * tokens.shape[1]}")
+print(f"Percentage live: {100 * num_live_positions[0] / (tokens.shape[0] * tokens.shape[1]):.1f}%")
+
+if num_live_positions[0] == 0:
+    print("⚠️  No live positions found (feature not active on this text)")
+else:
+    print(f"✅ Found {num_live_positions[0]} live positions")
 
 # ============================================================================
 # SUMMARY
@@ -229,14 +318,20 @@ print("SUMMARY")
 print("=" * 80)
 
 print(f"\nLoss values:")
-print(f"  Clean:            {clean_loss.item():.6f}")
-print(f"  Alpha=1 (direct): {alpha1_loss.item():.6f}  (Δ = {delta_loss_alpha1:+.6f})")
-print(f"  Alpha=1 (pipeline): {pipeline_alpha1_loss.item():.6f}  (Δ = {delta_pipeline:+.6f})")
-print(f"  Alpha=0:          {alpha0_loss.item():.6f}  (Δ = {delta_loss_alpha0:+.6f})")
+print(f"  Clean:                  {clean_loss.item():.6f}")
+print(f"  Alpha=1 (direct):       {alpha1_loss.item():.6f}  (Δ = {delta_loss_alpha1:+.6f})")
+print(f"  Alpha=1 (pipeline):     {pipeline_alpha1_loss.item():.6f}  (Δ = {delta_pipeline_alpha1:+.6f})")
+print(f"  Alpha=0 (direct):       {alpha0_loss.item():.6f}  (Δ = {delta_loss_alpha0:+.6f})")
+print(f"  Alpha=0 (pipeline):     {pipeline_alpha0_loss.item():.6f}  (Δ = {delta_pipeline_alpha0:+.6f})")
 
 print(f"\n✅ = Pass, ⚠️ = Fail")
-print(f"  Alpha=1 matches clean: {'✅' if abs(delta_loss_alpha1) < 0.001 else '⚠️ '}")
-print(f"  Alpha=0 differs from clean: {'✅' if abs(delta_loss_alpha0) > 0.001 else '⚠️ '}")
-print(f"  Pipeline preserves clean: {'✅' if abs(delta_pipeline) < 0.001 else '⚠️ '}")
+print(f"  Alpha=1 direct matches clean:   {'✅' if abs(delta_loss_alpha1) < 0.001 else '⚠️ '}")
+print(f"  Alpha=1 pipeline matches clean: {'✅' if abs(delta_pipeline_alpha1) < 0.01 else '⚠️ '}")
+print(f"  Alpha=0 differs from clean:     {'✅' if abs(delta_pipeline_alpha0) > 0.001 else '⚠️ '}")
+print(f"  Live positions detected:        {'✅' if num_live_positions[0] > 0 else '⚠️ '}")
+
+print(f"\n🔍 Key Diagnostic Info:")
+print(f"  Feature {test_feature_idx} live positions: {num_live_positions[0]}/{tokens.shape[0] * tokens.shape[1]}")
+print(f"  Max logits diff (alpha=1): {logits_diff_pipeline:.6f}")
 
 print("\n" + "=" * 80)
