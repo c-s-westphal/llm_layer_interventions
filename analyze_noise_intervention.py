@@ -506,26 +506,42 @@ def main():
         for feature_id in range(overall_max.shape[0]):
             feature_activations[(layer, feature_id)] = overall_max[feature_id].item()
 
-    # Select top K features by activation
-    top_by_activation = sorted(
-        feature_activations.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:args.top_k_activation]
+    # Select top K features by activation PER LAYER
+    top_by_activation = []
+    logger.info(f"\nTop {args.top_k_activation} features by activation per layer:")
+    for layer in config["layers"]:
+        # Get features for this layer
+        layer_features = {(l, f): act for (l, f), act in feature_activations.items() if l == layer}
+        # Sort and take top K
+        top_k = sorted(layer_features.items(), key=lambda x: x[1], reverse=True)[:args.top_k_activation]
+        top_by_activation.extend(top_k)
 
-    logger.info(f"\nTop {args.top_k_activation} features by activation:")
-    for (layer, feature_id), activation in top_by_activation:
-        logger.info(f"  Layer {layer}, Feature {feature_id}: {activation:.4f}")
+        logger.info(f"  Layer {layer}:")
+        for (l, feature_id), activation in top_k:
+            logger.info(f"    Feature {feature_id}: {activation:.4f}")
 
-    # Select top K features by interpretability (label_confidence)
-    top_by_interpretability = features_df.nlargest(args.top_k_interpretability, "label_confidence")
+    # Select top K features by interpretability PER LAYER
+    top_by_interpretability_list = []
+    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer:")
+    for layer in config["layers"]:
+        # Get features for this layer from CSV
+        layer_features = features_df[features_df["layer"] == layer]
+        # Sort by confidence and take top K
+        top_k = layer_features.nlargest(min(args.top_k_interpretability, len(layer_features)), "label_confidence")
+        top_by_interpretability_list.append(top_k)
 
-    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability:")
-    for _, row in top_by_interpretability.iterrows():
-        logger.info(
-            f"  Layer {row['layer']}, Feature {row['feature_id']}: "
-            f"conf={row['label_confidence']:.2f}, label='{row['label']}'"
-        )
+        logger.info(f"  Layer {layer}:")
+        for _, row in top_k.iterrows():
+            logger.info(
+                f"    Feature {row['feature_id']}: "
+                f"conf={row['label_confidence']:.2f}, label='{row['label']}'"
+            )
+
+    # Concatenate all layers
+    if top_by_interpretability_list:
+        top_by_interpretability = pd.concat(top_by_interpretability_list, ignore_index=True)
+    else:
+        top_by_interpretability = pd.DataFrame()
 
     # Process features
     results = []
@@ -620,16 +636,39 @@ def main():
     logger.info(f"    Mean median probability change: {interp_results['median'].mean():.4f}")
     logger.info(f"    Mean KLD: {interp_results['kld'].mean():.4f}")
 
-    logger.info("\nBy Layer (all features):")
+    logger.info("\nBy Layer and Feature Type:")
     for layer in sorted(results_df["layer"].unique()):
-        layer_results = results_df[results_df["layer"] == layer]
-        logger.info(
-            f"  Layer {layer}: "
-            f"mean_median={layer_results['median'].mean():.4f}, "
-            f"median_median={layer_results['median'].median():.4f}, "
-            f"mean_kld={layer_results['kld'].mean():.4f}, "
-            f"n_features={len(layer_results)}"
-        )
+        logger.info(f"\n  Layer {layer}:")
+
+        # Activation-based features
+        layer_activation = results_df[
+            (results_df["layer"] == layer) &
+            (results_df["selection_method"] == "activation")
+        ]
+        if len(layer_activation) > 0:
+            logger.info(
+                f"    Activation features (n={len(layer_activation)}): "
+                f"mean_median={layer_activation['median'].mean():.4f}, "
+                f"median_median={layer_activation['median'].median():.4f}, "
+                f"mean_kld={layer_activation['kld'].mean():.4f}"
+            )
+        else:
+            logger.info(f"    Activation features (n=0): none")
+
+        # Interpretability-based features
+        layer_interp = results_df[
+            (results_df["layer"] == layer) &
+            (results_df["selection_method"] == "interpretability")
+        ]
+        if len(layer_interp) > 0:
+            logger.info(
+                f"    Interpretability features (n={len(layer_interp)}): "
+                f"mean_median={layer_interp['median'].mean():.4f}, "
+                f"median_median={layer_interp['median'].median():.4f}, "
+                f"mean_kld={layer_interp['kld'].mean():.4f}"
+            )
+        else:
+            logger.info(f"    Interpretability features (n=0): none")
 
     logger.info("\nDone!")
 
