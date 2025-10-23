@@ -532,14 +532,14 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"  Layer {layer}, Feature {feature_id}: {activation:.4f}")
 
-    # Select top K features by interpretability (label_conf)
-    top_by_interpretability = features_df.nlargest(args.top_k_interpretability, "label_conf")
+    # Select top K features by interpretability (label_confidence)
+    top_by_interpretability = features_df.nlargest(args.top_k_interpretability, "label_confidence")
 
     logger.info(f"\nTop {args.top_k_interpretability} features by interpretability:")
     for _, row in top_by_interpretability.iterrows():
         logger.info(
-            f"  Layer {row['layer']}, Feature {row['feature']}: "
-            f"conf={row['label_conf']:.2f}, label='{row['label']}'"
+            f"  Layer {row['layer']}, Feature {row['feature_id']}: "
+            f"conf={row['label_confidence']:.2f}, label='{row['label']}'"
         )
 
     # Process features
@@ -588,9 +588,9 @@ def main():
 
     for _, row in top_by_interpretability.iterrows():
         layer = int(row["layer"])
-        feature_id = int(row["feature"])
+        feature_id = int(row["feature_id"])
         label = row["label"]
-        conf = row["label_conf"]
+        conf = row["label_confidence"]
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
@@ -619,7 +619,7 @@ def main():
             "feature_id": feature_id,
             "selection_method": "interpretability",
             "label": label,
-            "label_conf": conf,
+            "label_confidence": conf,
             "max_activation": max_act,
             "noise_level": noise_level,
             "achieved_kld": achieved_kld,
