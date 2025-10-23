@@ -309,7 +309,7 @@ def measure_probability_changes(
         Dictionary with statistics (mean, median, etc.)
     """
     logger = logger or logging.getLogger("noise_intervention")
-    logger.info(f"  Measuring probability changes on top-10 tokens (noise={noise_percentage*100:.1f}%)...")
+    logger.info(f"  Measuring probability changes on TARGET feature {feature_id} with {noise_percentage*100:.1f}% noise...")
 
     # Log which tokens we're analyzing
     logger.info(f"  Analyzing probability changes for tokens:")
@@ -419,7 +419,7 @@ def measure_probability_changes_random_control(
     while random_feature_id == feature_id:
         random_feature_id = np.random.randint(0, d_sae)
 
-    logger.info(f"  Measuring probability changes on RANDOM feature {random_feature_id} (control)...")
+    logger.info(f"  Measuring probability changes on RANDOM feature {random_feature_id} vs TARGET feature {feature_id} (control)...")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
