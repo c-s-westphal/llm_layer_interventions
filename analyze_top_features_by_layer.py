@@ -173,31 +173,38 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
     for feat_id, mean_act in top_features:
         logger.info(f"Layer {layer}, Feature {feat_id}: Running ablation...")
 
-        # Find top-10 output tokens for this feature
         sae = saes[layer]
-        feature_direction = sae.W_dec[feat_id].cpu()  # [d_model]
 
-        # Check if we need to transpose - W_U shape should be [d_model, vocab_size]
-        w_u = model.W_U.cpu()
-        logger.info(f"  W_U shape: {w_u.shape}, feature_direction shape: {feature_direction.shape}")
+        # First pass: Get clean output probabilities to find top-10 tokens
+        logger.info("  First pass: Finding top-10 tokens by clean probability...")
 
-        # Compute logit contributions
-        logits_contribution = feature_direction @ w_u  # Should be [vocab_size]
-        logger.info(f"  Logits contribution shape: {logits_contribution.shape}")
-        logger.info(f"  Logits contribution range: [{logits_contribution.min().item():.4f}, {logits_contribution.max().item():.4f}]")
+        all_clean_probs = []  # Collect probabilities across corpus
 
-        # Get top 10 PROMOTED tokens (most positive contribution)
-        top_10_tokens = torch.topk(logits_contribution, k=10).indices.tolist()
-        top_10_values = torch.topk(logits_contribution, k=10).values.tolist()
+        # Quick pass through small sample to find top tokens
+        sample_size = min(50, len(test_data))
+        for sample_idx in range(0, sample_size, batch_size):
+            batch_end = min(sample_idx + batch_size, sample_size)
+            batch_tokens = test_data[sample_idx:batch_end]
+            batch_dict = collate_batch(batch_tokens, device=device)
 
-        logger.info(f"  Top-10 PROMOTED tokens (positive contribution): {[repr(model.tokenizer.decode([t])) for t in top_10_tokens]}")
-        logger.info(f"  Their logit contributions: {[f'{v:.4f}' for v in top_10_values]}")
+            with torch.no_grad():
+                clean_logits = model(batch_dict["input_ids"])
+                clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
 
-        # Also get bottom 10 (most suppressed tokens - negative contribution)
-        bottom_10_tokens = torch.topk(logits_contribution, k=10, largest=False).indices.tolist()
-        bottom_10_values = torch.topk(logits_contribution, k=10, largest=False).values.tolist()
-        logger.info(f"  Bottom-10 SUPPRESSED tokens (negative contribution): {[repr(model.tokenizer.decode([t])) for t in bottom_10_tokens]}")
-        logger.info(f"  Their logit contributions: {[f'{v:.4f}' for v in bottom_10_values]}")
+                # Average over batch and sequence
+                mask = batch_dict["attention_mask"][:, 1:].bool()
+                avg_probs = (clean_probs * mask.unsqueeze(-1)).sum(dim=(0, 1)) / mask.sum()  # [vocab]
+                all_clean_probs.append(avg_probs.cpu())
+
+        # Average across sample batches
+        avg_clean_probs = torch.stack(all_clean_probs).mean(dim=0)  # [vocab_size]
+
+        # Get top-10 tokens by probability
+        top_10_tokens = torch.topk(avg_clean_probs, k=10).indices.tolist()
+        top_10_probs = torch.topk(avg_clean_probs, k=10).values.tolist()
+
+        logger.info(f"  Top-10 tokens by clean probability: {[repr(model.tokenizer.decode([t])) for t in top_10_tokens]}")
+        logger.info(f"  Their clean probabilities: {[f'{p:.6f}' for p in top_10_probs]}")
 
         # Create intervention manager
         intervention_manager = FeatureIntervention(
@@ -210,6 +217,9 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
 
         # No threshold needed since we always intervene
         intervention_manager.thresholds[(layer, feat_id)] = 0.0
+
+        # Second pass: Measure ablation effects on full corpus
+        logger.info("  Second pass: Measuring ablation effects...")
 
         # Track metrics across corpus
         clean_losses = []
@@ -281,20 +291,21 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
                 relative_decrease_masked = relative_decrease[mask_2d]
                 top10_prob_decreases.extend(relative_decrease_masked.cpu().tolist())
 
-                # Debug: Print first batch, first position
+                # Debug: Print first batch stats
                 if batch_idx == 0:
                     b, p = 0, 0
                     if mask_2d[b, p]:
-                        logger.info(f"    [DEBUG batch {batch_idx}, pos {p}]:")
+                        logger.info(f"    [DEBUG first position]:")
                         logger.info(f"      Clean top-10 avg prob: {clean_top10_probs[b, p].item():.6f}")
                         logger.info(f"      Ablated top-10 avg prob: {ablated_top10_probs[b, p].item():.6f}")
-                        logger.info(f"      Relative change: {relative_decrease[b, p].item():.6f}")
+                        logger.info(f"      Relative change: {relative_decrease[b, p].item():.4f}")
                         # Show individual token probs
                         for i, tok_idx in enumerate(top_10_tokens[:3]):  # Just first 3
                             tok_str = model.tokenizer.decode([tok_idx])
                             clean_p = clean_probs[b, p, tok_idx].item()
                             ablated_p = ablation_probs[b, p, tok_idx].item()
-                            logger.info(f"        Token {repr(tok_str)}: {clean_p:.6f} → {ablated_p:.6f}")
+                            change = (clean_p - ablated_p) / (clean_p + 1e-10)
+                            logger.info(f"        {repr(tok_str)}: {clean_p:.6f} → {ablated_p:.6f} (change: {change:+.4f})")
 
                 # Find max decrease in this batch for snippet
                 for b_idx in range(len(batch_tokens)):
