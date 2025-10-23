@@ -166,38 +166,16 @@ class FeatureIntervention:
             Returns:
                 Modified activations
             """
-            # Clone original activations
-            modified_acts = activations.clone()
-
-            # Encode to SAE latent space to find live positions
+            # Encode to SAE latent space
             sae_acts = sae.encode(activations)  # [batch, seq, d_sae]
 
-            # Create mask for "live" positions
-            feature_acts = sae_acts[:, :, feature_id]  # [batch, seq]
-            live_mask = feature_acts >= threshold
+            # Apply intervention to the feature (regardless of magnitude)
+            # Note: This applies SAE reconstruction to all positions, but the
+            # intervention effect should dominate over reconstruction error
+            sae_acts[:, :, feature_id] *= alpha
 
-            # If no live positions, return unchanged activations
-            if not live_mask.any():
-                return activations
-
-            # Only apply SAE encode→decode to live positions
-            # Get indices of live positions
-            batch_indices, seq_indices = torch.where(live_mask)
-
-            # Process each live position individually
-            for batch_idx, seq_idx in zip(batch_indices, seq_indices):
-                # Encode this position only
-                pos_acts = activations[batch_idx, seq_idx:seq_idx+1, :]  # [1, d_model]
-                pos_sae_acts = sae.encode(pos_acts)  # [1, d_sae]
-
-                # Apply intervention
-                pos_sae_acts[0, feature_id] *= alpha
-
-                # Decode back
-                pos_modified = sae.decode(pos_sae_acts)  # [1, d_model]
-
-                # Update modified activations at this position
-                modified_acts[batch_idx, seq_idx, :] = pos_modified[0, :]
+            # Decode back to activation space
+            modified_acts = sae.decode(sae_acts)
 
             return modified_acts
 

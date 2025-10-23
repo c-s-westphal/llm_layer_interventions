@@ -117,13 +117,13 @@ delta_loss_alpha1 = alpha1_loss.item() - clean_loss.item()
 logits_diff = (clean_logits - alpha1_logits).abs().max().item()
 
 print(f"\n*** COMPARISON: Clean vs Alpha=1 ***")
-print(f"Delta loss: {delta_loss_alpha1:.6f} (should be ~0.0)")
+print(f"Delta loss: {delta_loss_alpha1:.6f} (should be small due to SAE reconstruction)")
 print(f"Max logits difference: {logits_diff:.6f} (should be small)")
 
-if abs(delta_loss_alpha1) > 0.001:
-    print("⚠️  WARNING: Alpha=1 does NOT match clean! Intervention may be broken.")
+if abs(delta_loss_alpha1) > 0.1:
+    print("⚠️  WARNING: Alpha=1 has large effect! Intervention may be broken.")
 else:
-    print("✅ Alpha=1 matches clean (within tolerance)")
+    print("✅ Alpha=1 shows small reconstruction error (expected)")
 
 # ============================================================================
 # TEST 3: Run with alpha=0 (ablation - should change a lot)
@@ -169,19 +169,21 @@ delta_loss_alpha0 = alpha0_loss.item() - clean_loss.item()
 logits_diff_alpha0 = (clean_logits - alpha0_logits).abs().max().item()
 
 print(f"\n*** COMPARISON: Clean vs Alpha=0 ***")
-print(f"Delta loss: {delta_loss_alpha0:.6f} (should be non-zero)")
-print(f"Max logits difference: {logits_diff_alpha0:.6f} (should be large)")
+print(f"Delta loss: {delta_loss_alpha0:.6f}")
+print(f"Max logits difference: {logits_diff_alpha0:.6f}")
 
-if abs(delta_loss_alpha0) < 0.001:
-    print("⚠️  WARNING: Alpha=0 has no effect! Intervention is broken.")
+# Note: Even if feature isn't active (value=0), ablating it still goes through
+# SAE reconstruction, so we expect SOME change (at minimum, reconstruction error)
+if abs(delta_loss_alpha0) < 0.01:
+    print("⚠️  WARNING: Alpha=0 has minimal effect (possible issue or inactive feature)")
 else:
-    print("✅ Alpha=0 changes output (ablation works)")
+    print("✅ Alpha=0 changes output")
 
 # ============================================================================
-# TEST 4: Check if fixed pipeline implementation preserves clean at alpha=1
+# TEST 4: Check pipeline implementation with alpha=1 (baseline reconstruction)
 # ============================================================================
 print("\n" + "=" * 80)
-print("TEST 4: Checking FIXED pipeline implementation (alpha=1)")
+print("TEST 4: Checking pipeline implementation (alpha=1)")
 print("=" * 80)
 
 # Simulate what the pipeline does
@@ -196,7 +198,7 @@ intervention_manager = FeatureIntervention(
     live_percentile=90,
 )
 
-# Mock calibration - use very low threshold so feature is "live"
+# Mock calibration
 intervention_manager.thresholds[(layer, feature_idx)] = 0.001
 
 print("Creating intervention hook via pipeline (alpha=1.0)...")
@@ -216,26 +218,27 @@ delta_pipeline_alpha1 = pipeline_alpha1_loss.item() - clean_loss.item()
 logits_diff_pipeline = (clean_logits - pipeline_alpha1_logits).abs().max().item()
 
 print(f"\nPipeline alpha=1 loss: {pipeline_alpha1_loss.item():.6f}")
-print(f"Delta from clean: {delta_pipeline_alpha1:.6f} (should be ~0.0)")
-print(f"Max logits difference: {logits_diff_pipeline:.6f} (should be small)")
+print(f"Delta from clean: {delta_pipeline_alpha1:.6f} (SAE reconstruction baseline)")
+print(f"Max logits difference: {logits_diff_pipeline:.6f}")
 
-if abs(delta_pipeline_alpha1) > 0.01:  # Allow small reconstruction error
-    print("⚠️  ISSUE: Pipeline doesn't preserve clean at alpha=1")
+# Should match the direct alpha=1 test (both apply SAE reconstruction)
+if abs(delta_pipeline_alpha1 - delta_loss_alpha1) > 0.001:
+    print("⚠️  ISSUE: Pipeline alpha=1 doesn't match direct alpha=1")
 else:
-    print("✅ Pipeline preserves clean at alpha=1")
+    print("✅ Pipeline matches direct implementation")
 
 # ============================================================================
-# TEST 5: Check if pipeline ablation (alpha=0) works on active feature
+# TEST 5: Check if pipeline ablation (alpha=0) works
 # ============================================================================
 print("\n" + "=" * 80)
-print("TEST 5: Checking pipeline ablation (alpha=0) on active feature")
+print("TEST 5: Checking pipeline ablation (alpha=0)")
 print("=" * 80)
 
-# Try a feature that's more likely to be active (lower index features often more general)
-test_feature_idx = 100  # Try a different feature
+# Try a different feature
+test_feature_idx = 100
 print(f"Testing with feature {test_feature_idx}...")
 
-# Mock calibration with very low threshold
+# Mock calibration
 intervention_manager.thresholds[(layer, test_feature_idx)] = 0.001
 
 print("Creating intervention hook via pipeline (alpha=0.0)...")
@@ -258,57 +261,51 @@ print(f"\nPipeline alpha=0 loss: {pipeline_alpha0_loss.item():.6f}")
 print(f"Delta from clean: {delta_pipeline_alpha0:.6f}")
 print(f"Max logits difference: {logits_diff_alpha0_pipeline:.6f}")
 
-if abs(delta_pipeline_alpha0) < 0.001:
-    print("⚠️  WARNING: Alpha=0 has no effect (feature may not be active)")
+# Should differ from alpha=1 (ablation effect beyond reconstruction)
+delta_vs_alpha1 = abs(delta_pipeline_alpha0 - delta_pipeline_alpha1)
+print(f"Delta vs alpha=1: {delta_vs_alpha1:.6f}")
+
+if delta_vs_alpha1 < 0.001:
+    print("⚠️  WARNING: Alpha=0 same as alpha=1 (no ablation effect)")
 else:
-    print("✅ Alpha=0 changes output (ablation works)")
+    print("✅ Alpha=0 differs from alpha=1 (ablation works)")
 
 # ============================================================================
-# TEST 6: Verify fix by checking SAE reconstruction only applied to live positions
+# TEST 6: Verify SAE reconstruction baseline is consistent
 # ============================================================================
 print("\n" + "=" * 80)
-print("TEST 6: Verify SAE only applied to live positions")
+print("TEST 6: Measure SAE reconstruction error baseline")
 print("=" * 80)
 
-# Create a hook that reports how many positions it modifies
-num_live_positions = [0]  # Use list to allow mutation in nested function
-
-def diagnostic_hook(activations, hook):
-    """Hook that counts live positions."""
-    modified_acts = activations.clone()
-
+# Test with a "no-op" intervention (multiply all features by 1.0)
+def sae_passthrough_hook(activations, hook):
+    """Hook that applies SAE reconstruction without modifying features."""
     sae_acts = sae.encode(activations)
-    feature_acts = sae_acts[:, :, test_feature_idx]
-    live_mask = feature_acts >= 0.001
-
-    num_live_positions[0] = live_mask.sum().item()
-
-    if not live_mask.any():
-        return activations
-
-    batch_indices, seq_indices = torch.where(live_mask)
-
-    for batch_idx, seq_idx in zip(batch_indices, seq_indices):
-        pos_acts = activations[batch_idx, seq_idx:seq_idx+1, :]
-        pos_sae_acts = sae.encode(pos_acts)
-        pos_sae_acts[0, test_feature_idx] *= 1.0  # No change
-        pos_modified = sae.decode(pos_sae_acts)
-        modified_acts[batch_idx, seq_idx, :] = pos_modified[0, :]
-
-    return modified_acts
+    # Don't modify any features - just reconstruct
+    reconstructed = sae.decode(sae_acts)
+    return reconstructed
 
 with torch.no_grad():
-    with model.hooks([(hook_name, diagnostic_hook)]):
-        diagnostic_logits = model(tokens)
+    with model.hooks([(hook_name, sae_passthrough_hook)]):
+        sae_baseline_logits = model(tokens)
 
-print(f"Number of live positions: {num_live_positions[0]}")
-print(f"Total positions: {tokens.shape[0] * tokens.shape[1]}")
-print(f"Percentage live: {100 * num_live_positions[0] / (tokens.shape[0] * tokens.shape[1]):.1f}%")
+    sae_baseline_loss = torch.nn.functional.cross_entropy(
+        sae_baseline_logits[0, :-1, :],
+        tokens[0, 1:],
+        reduction='mean'
+    )
 
-if num_live_positions[0] == 0:
-    print("⚠️  No live positions found (feature not active on this text)")
+delta_sae_baseline = sae_baseline_loss.item() - clean_loss.item()
+
+print(f"SAE reconstruction baseline loss: {sae_baseline_loss.item():.6f}")
+print(f"Delta from clean: {delta_sae_baseline:.6f}")
+print(f"This is the minimum 'noise floor' for all interventions")
+
+# This should match alpha=1 intervention
+if abs(delta_sae_baseline - delta_pipeline_alpha1) < 0.001:
+    print("✅ Alpha=1 matches pure SAE reconstruction (as expected)")
 else:
-    print(f"✅ Found {num_live_positions[0]} live positions")
+    print("⚠️  WARNING: Alpha=1 differs from pure reconstruction")
 
 # ============================================================================
 # SUMMARY
@@ -319,19 +316,21 @@ print("=" * 80)
 
 print(f"\nLoss values:")
 print(f"  Clean:                  {clean_loss.item():.6f}")
+print(f"  SAE reconstruction:     {sae_baseline_loss.item():.6f}  (Δ = {delta_sae_baseline:+.6f}) [baseline]")
 print(f"  Alpha=1 (direct):       {alpha1_loss.item():.6f}  (Δ = {delta_loss_alpha1:+.6f})")
 print(f"  Alpha=1 (pipeline):     {pipeline_alpha1_loss.item():.6f}  (Δ = {delta_pipeline_alpha1:+.6f})")
 print(f"  Alpha=0 (direct):       {alpha0_loss.item():.6f}  (Δ = {delta_loss_alpha0:+.6f})")
 print(f"  Alpha=0 (pipeline):     {pipeline_alpha0_loss.item():.6f}  (Δ = {delta_pipeline_alpha0:+.6f})")
 
 print(f"\n✅ = Pass, ⚠️ = Fail")
-print(f"  Alpha=1 direct matches clean:   {'✅' if abs(delta_loss_alpha1) < 0.001 else '⚠️ '}")
-print(f"  Alpha=1 pipeline matches clean: {'✅' if abs(delta_pipeline_alpha1) < 0.01 else '⚠️ '}")
-print(f"  Alpha=0 differs from clean:     {'✅' if abs(delta_pipeline_alpha0) > 0.001 else '⚠️ '}")
-print(f"  Live positions detected:        {'✅' if num_live_positions[0] > 0 else '⚠️ '}")
+print(f"  Alpha=1 has small effect:              {'✅' if abs(delta_loss_alpha1) < 0.1 else '⚠️ '}")
+print(f"  Pipeline matches direct (alpha=1):     {'✅' if abs(delta_pipeline_alpha1 - delta_loss_alpha1) < 0.001 else '⚠️ '}")
+print(f"  Pipeline matches SAE baseline:         {'✅' if abs(delta_pipeline_alpha1 - delta_sae_baseline) < 0.001 else '⚠️ '}")
+print(f"  Alpha=0 differs from alpha=1:          {'✅' if abs(delta_pipeline_alpha0 - delta_pipeline_alpha1) > 0.001 else '⚠️ '}")
 
 print(f"\n🔍 Key Diagnostic Info:")
-print(f"  Feature {test_feature_idx} live positions: {num_live_positions[0]}/{tokens.shape[0] * tokens.shape[1]}")
-print(f"  Max logits diff (alpha=1): {logits_diff_pipeline:.6f}")
+print(f"  SAE reconstruction error: {delta_sae_baseline:.6f} (noise floor for all interventions)")
+print(f"  Feature {feature_idx} activation: {sae.encode(model.run_with_cache(tokens, names_filter=[hook_name])[1][hook_name])[0, -1, feature_idx].item():.6f}")
+print(f"  Feature {test_feature_idx} activation: {sae.encode(model.run_with_cache(tokens, names_filter=[hook_name])[1][hook_name])[0, -1, test_feature_idx].item():.6f}")
 
 print("\n" + "=" * 80)
