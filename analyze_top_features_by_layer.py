@@ -176,10 +176,22 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
         # Find top-10 output tokens for this feature
         sae = saes[layer]
         feature_direction = sae.W_dec[feat_id].cpu()  # [d_model]
-        logits_contribution = feature_direction @ model.W_U.cpu()  # [vocab_size]
-        top_10_tokens = torch.topk(logits_contribution, k=10).indices.tolist()
 
-        logger.info(f"  Top-10 output tokens: {[model.tokenizer.decode([t]) for t in top_10_tokens]}")
+        # Check if we need to transpose - W_U shape should be [d_model, vocab_size]
+        w_u = model.W_U.cpu()
+        logger.info(f"  W_U shape: {w_u.shape}, feature_direction shape: {feature_direction.shape}")
+
+        # Compute logit contributions
+        logits_contribution = feature_direction @ w_u  # Should be [vocab_size]
+        logger.info(f"  Logits contribution shape: {logits_contribution.shape}")
+        logger.info(f"  Logits contribution range: [{logits_contribution.min().item():.4f}, {logits_contribution.max().item():.4f}]")
+
+        # Get top 10 PROMOTED tokens (most positive contribution)
+        top_10_tokens = torch.topk(logits_contribution, k=10).indices.tolist()
+        top_10_values = torch.topk(logits_contribution, k=10).values.tolist()
+
+        logger.info(f"  Top-10 PROMOTED tokens: {[model.tokenizer.decode([t]) for t in top_10_tokens]}")
+        logger.info(f"  Their logit contributions: {[f'{v:.4f}' for v in top_10_values]}")
 
         # Create intervention manager
         intervention_manager = FeatureIntervention(
