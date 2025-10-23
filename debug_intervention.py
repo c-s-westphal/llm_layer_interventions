@@ -23,14 +23,17 @@ print("\n1. Loading GPT-2 Small...")
 model = HookedTransformer.from_pretrained("gpt2-small", device="cuda")
 print(f"   Model loaded: {model.cfg.n_layers} layers, d_model={model.cfg.d_model}")
 
-# Load one SAE for testing
-print("\n2. Loading SAE for layer 0...")
-sae = SAE.from_pretrained(
-    release="gpt2-small-res-jb",
-    sae_id="blocks.0.hook_resid_pre",
-    device="cuda"
-)
-print(f"   SAE loaded: d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
+# Load SAEs for layer 0 and 1
+print("\n2. Loading SAEs for layers 0 and 1...")
+saes = {}
+for layer_idx in [0, 1]:
+    sae = SAE.from_pretrained(
+        release="gpt2-small-res-jb",
+        sae_id=f"blocks.{layer_idx}.hook_resid_pre",
+        device="cuda"
+    )
+    saes[layer_idx] = sae
+    print(f"   Layer {layer_idx} SAE loaded: d_in={sae.cfg.d_in}, d_sae={sae.cfg.d_sae}")
 
 # Test input
 test_text = "The quick brown fox jumps over the lazy dog"
@@ -38,11 +41,37 @@ tokens = model.to_tokens(test_text)
 print(f"\n3. Test input: '{test_text}'")
 print(f"   Tokens shape: {tokens.shape}")
 
-# Pick a feature to test
-layer = 0
-feature_idx = 12453  # From your CSV
+# Find active features for each layer
+print(f"\n4. Finding active features on this text...")
 
-print(f"\n4. Testing feature {feature_idx} at layer {layer}")
+with torch.no_grad():
+    hook_names = [f"blocks.{layer_idx}.hook_resid_pre" for layer_idx in [0, 1]]
+    _, cache = model.run_with_cache(tokens, names_filter=hook_names)
+
+active_features = {}
+for layer_idx in [0, 1]:
+    hook_name = f"blocks.{layer_idx}.hook_resid_pre"
+    acts = cache[hook_name]  # [1, seq, d_model]
+    sae_acts = saes[layer_idx].encode(acts)  # [1, seq, d_sae]
+
+    # Get max activation across all positions for each feature
+    max_acts = sae_acts[0].max(dim=0).values  # [d_sae]
+
+    # Find top 10 most active features
+    top_k = 10
+    top_values, top_indices = torch.topk(max_acts, k=top_k)
+
+    active_features[layer_idx] = []
+    print(f"\n   Layer {layer_idx} - Top {top_k} active features:")
+    for i, (feat_idx, feat_val) in enumerate(zip(top_indices.tolist(), top_values.tolist())):
+        print(f"      #{i+1}: Feature {feat_idx:5d} with max activation {feat_val:.4f}")
+        active_features[layer_idx].append((feat_idx, feat_val))
+
+# Select most active feature from layer 0 for detailed testing
+layer = 0
+feature_idx = active_features[layer][0][0]
+sae = saes[layer]
+print(f"\n5. Selected feature {feature_idx} from layer {layer} for detailed testing (activation: {active_features[layer][0][1]:.4f})")
 
 # ============================================================================
 # TEST 1: Clean run (no intervention)
@@ -228,15 +257,17 @@ else:
     print("✅ Pipeline matches direct implementation")
 
 # ============================================================================
-# TEST 5: Check if pipeline ablation (alpha=0) works
+# TEST 5: Check if pipeline ablation (alpha=0) works on ACTIVE feature
 # ============================================================================
 print("\n" + "=" * 80)
-print("TEST 5: Checking pipeline ablation (alpha=0)")
+print("TEST 5: Checking pipeline ablation (alpha=0) on ACTIVE feature")
 print("=" * 80)
 
-# Try a different feature
-test_feature_idx = 100
-print(f"Testing with feature {test_feature_idx}...")
+# Use an ACTIVE feature (second most active to avoid same as primary test feature)
+test_feature_idx = active_features[layer][1][0] if len(active_features[layer]) > 1 else active_features[layer][0][0]
+test_feature_activation = active_features[layer][1][1] if len(active_features[layer]) > 1 else active_features[layer][0][1]
+
+print(f"Testing with feature {test_feature_idx} (activation: {test_feature_activation:.4f})...")
 
 # Mock calibration
 intervention_manager.thresholds[(layer, test_feature_idx)] = 0.001
@@ -308,6 +339,63 @@ else:
     print("⚠️  WARNING: Alpha=1 differs from pure reconstruction")
 
 # ============================================================================
+# TEST 7: Compare interventions across layers 0 and 1
+# ============================================================================
+print("\n" + "=" * 80)
+print("TEST 7: Compare interventions across layers 0 and 1")
+print("=" * 80)
+
+for test_layer in [0, 1]:
+    print(f"\n--- Testing Layer {test_layer} ---")
+
+    # Get most active feature for this layer
+    test_feat = active_features[test_layer][0][0]
+    test_feat_act = active_features[test_layer][0][1]
+
+    print(f"Feature {test_feat} (activation: {test_feat_act:.4f})")
+
+    # Create intervention manager for this layer
+    test_intervention_manager = FeatureIntervention(
+        model=model,
+        saes={test_layer: saes[test_layer]},
+        hook="resid_pre",
+        live_percentile=90,
+    )
+    test_intervention_manager.thresholds[(test_layer, test_feat)] = 0.001
+
+    # Test alpha=0 and alpha=2
+    test_hook_name = f"blocks.{test_layer}.hook_resid_pre"
+
+    results = {}
+    for alpha_val in [0.0, 1.0, 2.0]:
+        hook_fn_test = test_intervention_manager.create_intervention_hook(test_layer, test_feat, alpha=alpha_val)
+
+        with torch.no_grad():
+            with model.hooks([(test_hook_name, hook_fn_test)]):
+                test_logits = model(tokens)
+
+            test_loss = torch.nn.functional.cross_entropy(
+                test_logits[0, :-1, :],
+                tokens[0, 1:],
+                reduction='mean'
+            )
+
+        results[alpha_val] = test_loss.item()
+        print(f"  Alpha={alpha_val}: loss={test_loss.item():.6f} (Δ={test_loss.item() - clean_loss.item():+.6f})")
+
+    # Check if alpha makes a difference
+    delta_0_vs_1 = abs(results[0.0] - results[1.0])
+    delta_2_vs_1 = abs(results[2.0] - results[1.0])
+
+    print(f"  |Alpha=0 - Alpha=1|: {delta_0_vs_1:.6f}")
+    print(f"  |Alpha=2 - Alpha=1|: {delta_2_vs_1:.6f}")
+
+    if delta_0_vs_1 > 0.001 or delta_2_vs_1 > 0.001:
+        print(f"  ✅ Layer {test_layer}: Interventions have measurable effects")
+    else:
+        print(f"  ⚠️  Layer {test_layer}: No intervention effects detected")
+
+# ============================================================================
 # SUMMARY
 # ============================================================================
 print("\n" + "=" * 80)
@@ -330,7 +418,13 @@ print(f"  Alpha=0 differs from alpha=1:          {'✅' if abs(delta_pipeline_al
 
 print(f"\n🔍 Key Diagnostic Info:")
 print(f"  SAE reconstruction error: {delta_sae_baseline:.6f} (noise floor for all interventions)")
-print(f"  Feature {feature_idx} activation: {sae.encode(model.run_with_cache(tokens, names_filter=[hook_name])[1][hook_name])[0, -1, feature_idx].item():.6f}")
-print(f"  Feature {test_feature_idx} activation: {sae.encode(model.run_with_cache(tokens, names_filter=[hook_name])[1][hook_name])[0, -1, test_feature_idx].item():.6f}")
+print(f"  Primary test feature (layer {layer}): {feature_idx} with activation {active_features[layer][0][1]:.4f}")
+print(f"  Secondary test feature (layer {layer}): {test_feature_idx} with activation {test_feature_activation:.4f}")
+
+print(f"\n📊 Top Active Features by Layer:")
+for test_layer in [0, 1]:
+    print(f"  Layer {test_layer}: Feature {active_features[test_layer][0][0]} (act={active_features[test_layer][0][1]:.4f}), "
+          f"Feature {active_features[test_layer][1][0]} (act={active_features[test_layer][1][1]:.4f}), "
+          f"Feature {active_features[test_layer][2][0]} (act={active_features[test_layer][2][1]:.4f})")
 
 print("\n" + "=" * 80)
