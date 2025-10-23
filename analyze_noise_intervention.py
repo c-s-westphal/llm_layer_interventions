@@ -218,22 +218,18 @@ def create_noise_hook(sae, feature_id: int, noise_percentage: float):
     return hook_fn
 
 
-def calibrate_noise_for_kld(
+def measure_kld_with_noise(
     model,
     sae,
     layer: int,
     feature_id: int,
     hook: str,
     data: List[torch.Tensor],
-    target_kld: float,
+    noise_percentage: float,
     batch_size: int,
-    max_iterations: int = 20,
-    tolerance: float = 0.1,
     logger: logging.Logger = None
-) -> Tuple[float, float]:
-    """Find noise percentage that achieves target KLD.
-
-    Uses binary search to find the noise percentage that produces the target KLD.
+) -> float:
+    """Measure KLD when adding fixed noise to a feature.
 
     Args:
         model: HookedTransformer model
@@ -242,71 +238,43 @@ def calibrate_noise_for_kld(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        target_kld: Target KLD value
+        noise_percentage: Fixed noise percentage to apply
         batch_size: Batch size
-        max_iterations: Maximum search iterations
-        tolerance: KLD tolerance
         logger: Logger instance
 
     Returns:
-        Tuple of (noise_percentage, achieved_kld)
+        Achieved KLD
     """
     logger = logger or logging.getLogger("noise_intervention")
     hook_name = f"blocks.{layer}.hook_{hook}"
 
-    # Binary search bounds (noise_percentage: 0 = no noise, 1 = 100% noise)
-    noise_low = 0.0
-    noise_high = 5.0  # Allow up to 500% noise relative to activation
+    logger.info(f"  Measuring KLD with {noise_percentage*100:.1f}% noise...")
 
-    logger.info(f"Calibrating noise for layer {layer}, feature {feature_id} (target KLD={target_kld})...")
+    # Measure KLD on first batch
+    batch_tokens = data[:batch_size]
+    batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-    for iteration in range(max_iterations):
-        noise_percentage = (noise_low + noise_high) / 2.0
+    # Clean run
+    with torch.no_grad():
+        clean_logits = model(batch_dict["input_ids"])
+        clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
 
-        # Measure KLD at this noise level (use first batch only for speed)
-        batch_tokens = data[:batch_size]
-        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+    # Noisy run
+    noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
 
-        # Clean run
-        with torch.no_grad():
-            clean_logits = model(batch_dict["input_ids"])
-            clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
+    with torch.no_grad():
+        noisy_logits = model.run_with_hooks(
+            batch_dict["input_ids"],
+            fwd_hooks=[(hook_name, noise_hook)]
+        )
+        noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
 
-        # Noisy run
-        noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
+    # Compute KLD
+    mask = batch_dict["attention_mask"][:, 1:]
+    kld = compute_kl_divergence(clean_probs, noisy_probs, mask)
 
-        with torch.no_grad():
-            noisy_logits = model.run_with_hooks(
-                batch_dict["input_ids"],
-                fwd_hooks=[(hook_name, noise_hook)]
-            )
-            noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
-
-        # Compute KLD
-        mask = batch_dict["attention_mask"][:, 1:]
-        kld = compute_kl_divergence(clean_probs, noisy_probs, mask)
-
-        logger.info(f"  Iteration {iteration+1}: noise_percentage={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-
-        # Check convergence
-        if abs(kld - target_kld) < tolerance:
-            logger.info(f"  Converged! Final noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-            return noise_percentage, kld
-
-        # Update search bounds
-        if kld < target_kld:
-            # Need more noise
-            noise_low = noise_percentage
-            # If we're hitting the upper bound, increase it
-            if noise_percentage > 0.95 * noise_high:
-                noise_high *= 2.0
-                logger.info(f"  Increasing search range to {noise_high*100:.0f}%")
-        else:
-            noise_high = noise_percentage
-
-    # Max iterations reached
-    logger.warning(f"  Max iterations reached. Best noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-    return noise_percentage, kld
+    logger.info(f"  KLD with {noise_percentage*100:.1f}% noise: {kld:.4f}")
+    return kld
 
 
 def measure_probability_changes(
@@ -413,9 +381,9 @@ def measure_probability_changes(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Noise-based feature intervention with KLD targeting")
+    parser = argparse.ArgumentParser(description="Noise-based feature intervention analysis")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--target_kld", type=float, default=3.0, help="Target KLD threshold")
+    parser.add_argument("--noise_percentage", type=float, default=0.1, help="Noise percentage (0.1 = 10%)")
     parser.add_argument("--top_k_activation", type=int, default=5, help="Top K features by activation")
     parser.add_argument("--top_k_interpretability", type=int, default=5, help="Top K features by interpretability")
     args = parser.parse_args()
@@ -435,10 +403,10 @@ def main():
     # Setup logging
     logger = setup_logging(output_dir)
     logger.info("="*80)
-    logger.info("NOISE-BASED INTERVENTION WITH KLD TARGETING")
+    logger.info("NOISE-BASED FEATURE INTERVENTION ANALYSIS")
     logger.info("="*80)
     logger.info(f"Config: {args.config}")
-    logger.info(f"Target KLD: {args.target_kld}")
+    logger.info(f"Fixed noise percentage: {args.noise_percentage*100:.1f}%")
     logger.info(f"Output directory: {output_dir}")
 
     # Set device
@@ -569,17 +537,17 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Calibrate noise percentage
-        noise_percentage, achieved_kld = calibrate_noise_for_kld(
+        # Measure KLD with fixed noise
+        kld = measure_kld_with_noise(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, args.target_kld,
+            calibration_data, args.noise_percentage,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens, args.noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -588,8 +556,8 @@ def main():
             "feature_id": feature_id,
             "selection_method": "activation",
             "max_activation": activation,
-            "noise_percentage": noise_percentage,
-            "achieved_kld": achieved_kld,
+            "noise_percentage": args.noise_percentage,
+            "kld": kld,
             **stats
         })
 
@@ -605,17 +573,17 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Calibrate noise percentage
-        noise_percentage, achieved_kld = calibrate_noise_for_kld(
+        # Measure KLD with fixed noise
+        kld = measure_kld_with_noise(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, args.target_kld,
+            calibration_data, args.noise_percentage,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens, args.noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -625,8 +593,8 @@ def main():
             "selection_method": "interpretability",
             "label": label,
             "label_confidence": conf,
-            "noise_percentage": noise_percentage,
-            "achieved_kld": achieved_kld,
+            "noise_percentage": args.noise_percentage,
+            "kld": kld,
             **stats
         })
 
@@ -641,15 +609,27 @@ def main():
     logger.info("SUMMARY")
     logger.info("="*80)
 
-    logger.info("\nBy Activation:")
+    logger.info("\nBy Selection Method:")
+    logger.info(f"  Activation (top {args.top_k_activation}):")
     activation_results = results_df[results_df["selection_method"] == "activation"]
-    logger.info(f"  Mean median probability change: {activation_results['median'].mean():.4f}")
-    logger.info(f"  Mean noise percentage: {activation_results['noise_percentage'].mean()*100:.1f}%")
+    logger.info(f"    Mean median probability change: {activation_results['median'].mean():.4f}")
+    logger.info(f"    Mean KLD: {activation_results['kld'].mean():.4f}")
 
-    logger.info("\nBy Interpretability:")
+    logger.info(f"\n  Interpretability (top {args.top_k_interpretability}):")
     interp_results = results_df[results_df["selection_method"] == "interpretability"]
-    logger.info(f"  Mean median probability change: {interp_results['median'].mean():.4f}")
-    logger.info(f"  Mean noise percentage: {interp_results['noise_percentage'].mean()*100:.1f}%")
+    logger.info(f"    Mean median probability change: {interp_results['median'].mean():.4f}")
+    logger.info(f"    Mean KLD: {interp_results['kld'].mean():.4f}")
+
+    logger.info("\nBy Layer (all features):")
+    for layer in sorted(results_df["layer"].unique()):
+        layer_results = results_df[results_df["layer"] == layer]
+        logger.info(
+            f"  Layer {layer}: "
+            f"mean_median={layer_results['median'].mean():.4f}, "
+            f"median_median={layer_results['median'].median():.4f}, "
+            f"mean_kld={layer_results['kld'].mean():.4f}, "
+            f"n_features={len(layer_results)}"
+        )
 
     logger.info("\nDone!")
 
