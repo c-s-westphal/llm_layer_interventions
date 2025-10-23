@@ -188,14 +188,13 @@ def compute_kl_divergence(
     return kl_mean.item()
 
 
-def create_noise_hook(sae, feature_id: int, noise_level: float, mean_activation: float):
-    """Create a hook that adds Gaussian noise to a feature.
+def create_noise_hook(sae, feature_id: int, noise_percentage: float):
+    """Create a hook that adds Gaussian noise proportional to actual activation.
 
     Args:
         sae: SAE instance
         feature_id: Feature ID to add noise to
-        noise_level: Noise standard deviation (scaled by mean_activation)
-        mean_activation: Mean activation value for scaling
+        noise_percentage: Percentage of activation to use as noise std (e.g., 0.05 = 5%)
 
     Returns:
         Hook function
@@ -204,9 +203,12 @@ def create_noise_hook(sae, feature_id: int, noise_level: float, mean_activation:
         # Encode to SAE latent space
         sae_acts = sae.encode(activations)  # [batch, seq, d_sae]
 
-        # Add Gaussian noise to feature (mean=0, std=noise_level*mean_activation)
-        noise = torch.randn_like(sae_acts[:, :, feature_id]) * noise_level * mean_activation
-        sae_acts[:, :, feature_id] = sae_acts[:, :, feature_id] + noise
+        # Add Gaussian noise proportional to actual activation at each position
+        # If activation is 100 and noise_percentage=0.05, adds N(0, 5) noise
+        # If activation is 0, adds no noise
+        feature_acts = sae_acts[:, :, feature_id]  # [batch, seq]
+        noise = torch.randn_like(feature_acts) * noise_percentage * torch.abs(feature_acts)
+        sae_acts[:, :, feature_id] = feature_acts + noise
 
         # Decode back
         modified_acts = sae.decode(sae_acts)
@@ -223,16 +225,15 @@ def calibrate_noise_for_kld(
     feature_id: int,
     hook: str,
     data: List[torch.Tensor],
-    mean_activation: float,
     target_kld: float,
     batch_size: int,
     max_iterations: int = 20,
     tolerance: float = 0.1,
     logger: logging.Logger = None
 ) -> Tuple[float, float]:
-    """Find noise level that achieves target KLD.
+    """Find noise percentage that achieves target KLD.
 
-    Uses binary search to find the noise level that produces the target KLD.
+    Uses binary search to find the noise percentage that produces the target KLD.
 
     Args:
         model: HookedTransformer model
@@ -241,7 +242,6 @@ def calibrate_noise_for_kld(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        mean_activation: Mean activation for scaling Gaussian noise
         target_kld: Target KLD value
         batch_size: Batch size
         max_iterations: Maximum search iterations
@@ -249,19 +249,19 @@ def calibrate_noise_for_kld(
         logger: Logger instance
 
     Returns:
-        Tuple of (noise_level, achieved_kld)
+        Tuple of (noise_percentage, achieved_kld)
     """
     logger = logger or logging.getLogger("noise_intervention")
     hook_name = f"blocks.{layer}.hook_{hook}"
 
-    # Binary search bounds (noise_level is std multiplier)
+    # Binary search bounds (noise_percentage: 0 = no noise, 1 = 100% noise)
     noise_low = 0.0
-    noise_high = 10.0  # Allow up to 10x mean_activation as std
+    noise_high = 5.0  # Allow up to 500% noise relative to activation
 
     logger.info(f"Calibrating noise for layer {layer}, feature {feature_id} (target KLD={target_kld})...")
 
     for iteration in range(max_iterations):
-        noise_level = (noise_low + noise_high) / 2.0
+        noise_percentage = (noise_low + noise_high) / 2.0
 
         # Measure KLD at this noise level (use first batch only for speed)
         batch_tokens = data[:batch_size]
@@ -273,7 +273,7 @@ def calibrate_noise_for_kld(
             clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
 
         # Noisy run
-        noise_hook = create_noise_hook(sae, feature_id, noise_level, mean_activation)
+        noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
 
         with torch.no_grad():
             noisy_logits = model.run_with_hooks(
@@ -286,22 +286,27 @@ def calibrate_noise_for_kld(
         mask = batch_dict["attention_mask"][:, 1:]
         kld = compute_kl_divergence(clean_probs, noisy_probs, mask)
 
-        logger.info(f"  Iteration {iteration+1}: noise_level={noise_level:.4f}, KLD={kld:.4f}")
+        logger.info(f"  Iteration {iteration+1}: noise_percentage={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
 
         # Check convergence
         if abs(kld - target_kld) < tolerance:
-            logger.info(f"  Converged! Final noise_level={noise_level:.4f}, KLD={kld:.4f}")
-            return noise_level, kld
+            logger.info(f"  Converged! Final noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
+            return noise_percentage, kld
 
         # Update search bounds
         if kld < target_kld:
-            noise_low = noise_level
+            # Need more noise
+            noise_low = noise_percentage
+            # If we're hitting the upper bound, increase it
+            if noise_percentage > 0.95 * noise_high:
+                noise_high *= 2.0
+                logger.info(f"  Increasing search range to {noise_high*100:.0f}%")
         else:
-            noise_high = noise_level
+            noise_high = noise_percentage
 
     # Max iterations reached
-    logger.warning(f"  Max iterations reached. Best noise_level={noise_level:.4f}, KLD={kld:.4f}")
-    return noise_level, kld
+    logger.warning(f"  Max iterations reached. Best noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
+    return noise_percentage, kld
 
 
 def measure_probability_changes(
@@ -312,13 +317,12 @@ def measure_probability_changes(
     hook: str,
     data: List[torch.Tensor],
     top_tokens: List[int],
-    noise_level: float,
-    mean_activation: float,
+    noise_percentage: float,
     batch_size: int,
     tokenizer,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
-    """Measure probability changes on top tokens at given noise level.
+    """Measure probability changes on top tokens at given noise percentage.
 
     Args:
         model: HookedTransformer model
@@ -328,8 +332,7 @@ def measure_probability_changes(
         hook: Hook type
         data: List of token tensors
         top_tokens: List of important token IDs
-        noise_level: Calibrated noise level
-        mean_activation: Mean activation
+        noise_percentage: Calibrated noise percentage
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         logger: Logger instance
@@ -338,7 +341,7 @@ def measure_probability_changes(
         Dictionary with statistics (mean, median, etc.)
     """
     logger = logger or logging.getLogger("noise_intervention")
-    logger.info(f"  Measuring probability changes on top-10 tokens...")
+    logger.info(f"  Measuring probability changes on top-10 tokens (noise={noise_percentage*100:.1f}%)...")
 
     # Log which tokens we're analyzing
     logger.info(f"  Analyzing probability changes for tokens:")
@@ -365,7 +368,7 @@ def measure_probability_changes(
             clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)
 
         # Noisy run
-        noise_hook = create_noise_hook(sae, feature_id, noise_level, mean_activation)
+        noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
 
         with torch.no_grad():
             noisy_logits = model.run_with_hooks(
@@ -566,23 +569,17 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Get mean activation
-        mean_act, std_act = get_mean_activation(
+        # Calibrate noise percentage
+        noise_percentage, achieved_kld = calibrate_noise_for_kld(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], logger
-        )
-
-        # Calibrate noise
-        noise_level, achieved_kld = calibrate_noise_for_kld(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, mean_act, args.target_kld,
+            calibration_data, args.target_kld,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_level, mean_act,
+            test_data, top_tokens, noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -590,9 +587,8 @@ def main():
             "layer": layer,
             "feature_id": feature_id,
             "selection_method": "activation",
-            "mean_activation": mean_act,
-            "std_activation": std_act,
-            "noise_level": noise_level,
+            "max_activation": activation,
+            "noise_percentage": noise_percentage,
             "achieved_kld": achieved_kld,
             **stats
         })
@@ -609,23 +605,17 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Get mean activation
-        mean_act, std_act = get_mean_activation(
+        # Calibrate noise percentage
+        noise_percentage, achieved_kld = calibrate_noise_for_kld(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], logger
-        )
-
-        # Calibrate noise
-        noise_level, achieved_kld = calibrate_noise_for_kld(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, mean_act, args.target_kld,
+            calibration_data, args.target_kld,
             config["batch_size"], logger=logger
         )
 
         # Measure probability changes
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_level, mean_act,
+            test_data, top_tokens, noise_percentage,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -635,9 +625,7 @@ def main():
             "selection_method": "interpretability",
             "label": label,
             "label_confidence": conf,
-            "mean_activation": mean_act,
-            "std_activation": std_act,
-            "noise_level": noise_level,
+            "noise_percentage": noise_percentage,
             "achieved_kld": achieved_kld,
             **stats
         })
@@ -656,12 +644,12 @@ def main():
     logger.info("\nBy Activation:")
     activation_results = results_df[results_df["selection_method"] == "activation"]
     logger.info(f"  Mean median probability change: {activation_results['median'].mean():.4f}")
-    logger.info(f"  Mean noise level: {activation_results['noise_level'].mean():.4f}")
+    logger.info(f"  Mean noise percentage: {activation_results['noise_percentage'].mean()*100:.1f}%")
 
     logger.info("\nBy Interpretability:")
     interp_results = results_df[results_df["selection_method"] == "interpretability"]
     logger.info(f"  Mean median probability change: {interp_results['median'].mean():.4f}")
-    logger.info(f"  Mean noise level: {interp_results['noise_level'].mean():.4f}")
+    logger.info(f"  Mean noise percentage: {interp_results['noise_percentage'].mean()*100:.1f}%")
 
     logger.info("\nDone!")
 
