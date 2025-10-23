@@ -34,7 +34,7 @@ with open("configs/default.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 # Override config for this analysis
-config["layers"] = list(range(12))  # All layers
+config["layers"] = list(range(1, 12))  # Layers 1-11 (skip layer 0 embeddings)
 config["calibration_passages"] = 200  # Enough to get good statistics
 config["test_passages"] = 500  # Test on reasonable corpus size
 
@@ -73,7 +73,7 @@ corpus_loader = CorpusLoader(
     logger=logger
 )
 
-calibration_data, _ = corpus_loader.load_and_tokenize()
+calibration_data, calibration_texts = corpus_loader.load_and_tokenize()
 logger.info(f"Loaded {len(calibration_data)} calibration passages")
 
 logger.info("Finding top 5 most active features per layer...")
@@ -152,27 +152,39 @@ test_corpus_loader = CorpusLoader(
     logger=logger
 )
 
-test_data, _ = test_corpus_loader.load_and_tokenize()
+test_data, test_texts = test_corpus_loader.load_and_tokenize()
 logger.info(f"Loaded {len(test_data)} test passages")
 
 # ============================================================================
-# Step 4: Ablate top features and measure d_loss per layer
+# Step 4: Ablate top features and measure effects
 # ============================================================================
 logger.info("Step 4: Ablating top features and measuring effects...")
 
-results_per_layer = {}  # {layer: [d_loss_1, d_loss_2, ..., d_loss_5]}
+results_per_layer = {}  # {layer: {'d_loss': [...], 'kl': [...], 'top10_decrease': [...]}}
+snippets_per_layer = {}  # {layer: {feat_id: snippet_info}}
 
 for layer in tqdm(config["layers"], desc="Ablating features"):
     top_features = top_features_per_layer[layer]
     d_losses = []
+    kl_divs = []
+    top10_decreases = []
+    snippets_per_layer[layer] = {}
 
     for feat_id, mean_act in top_features:
         logger.info(f"Layer {layer}, Feature {feat_id}: Running ablation...")
 
+        # Find top-10 output tokens for this feature
+        sae = saes[layer]
+        feature_direction = sae.W_dec[feat_id].cpu()  # [d_model]
+        logits_contribution = feature_direction @ model.W_U.cpu()  # [vocab_size]
+        top_10_tokens = torch.topk(logits_contribution, k=10).indices.tolist()
+
+        logger.info(f"  Top-10 output tokens: {[model.tokenizer.decode([t]) for t in top_10_tokens]}")
+
         # Create intervention manager
         intervention_manager = FeatureIntervention(
             model=model,
-            saes={layer: saes[layer]},
+            saes={layer: sae},
             hook=config["hook"],
             live_percentile=90,
             logger=logger
@@ -181,9 +193,15 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
         # No threshold needed since we always intervene
         intervention_manager.thresholds[(layer, feat_id)] = 0.0
 
-        # Process test data in batches
+        # Track metrics across corpus
         clean_losses = []
         ablation_losses = []
+        kls = []
+        top10_prob_decreases = []
+
+        # Track max decrease for snippet
+        max_decrease = 0.0
+        max_decrease_info = None
 
         num_batches = (len(test_data) + batch_size - 1) // batch_size
 
@@ -197,12 +215,13 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
             with torch.no_grad():
                 # Clean run
                 clean_logits = model(batch_dict["input_ids"])
+                clean_probs = torch.softmax(clean_logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
+
                 clean_loss = torch.nn.functional.cross_entropy(
                     clean_logits[:, :-1, :].reshape(-1, clean_logits.shape[-1]),
                     batch_dict["input_ids"][:, 1:].reshape(-1),
                     reduction='none'
                 )
-                # Mask padding
                 mask = batch_dict["attention_mask"][:, 1:].reshape(-1).bool()
                 clean_loss = clean_loss[mask].mean().item()
                 clean_losses.append(clean_loss)
@@ -216,6 +235,8 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
                 with model.hooks([(hook_name, hook_fn)]):
                     ablation_logits = model(batch_dict["input_ids"])
 
+                ablation_probs = torch.softmax(ablation_logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
+
                 ablation_loss = torch.nn.functional.cross_entropy(
                     ablation_logits[:, :-1, :].reshape(-1, ablation_logits.shape[-1]),
                     batch_dict["input_ids"][:, 1:].reshape(-1),
@@ -224,102 +245,253 @@ for layer in tqdm(config["layers"], desc="Ablating features"):
                 ablation_loss = ablation_loss[mask].mean().item()
                 ablation_losses.append(ablation_loss)
 
-        # Compute average d_loss for this feature
-        avg_clean = np.mean(clean_losses)
-        avg_ablation = np.mean(ablation_losses)
-        d_loss = avg_ablation - avg_clean
+                # Calculate KL divergence for each position
+                # KL(P_clean || P_ablated) = sum(P_clean * log(P_clean / P_ablated))
+                mask_2d = batch_dict["attention_mask"][:, 1:].bool()  # [batch, seq-1]
+
+                kl_per_position = (clean_probs * (torch.log(clean_probs + 1e-10) - torch.log(ablation_probs + 1e-10))).sum(dim=-1)  # [batch, seq-1]
+                kl_masked = kl_per_position[mask_2d]
+                kls.extend(kl_masked.cpu().tolist())
+
+                # Calculate top-10 token probability decrease
+                top_10_tensor = torch.tensor(top_10_tokens, device=device)
+
+                clean_top10_probs = clean_probs[:, :, top_10_tensor].mean(dim=-1)  # [batch, seq-1]
+                ablated_top10_probs = ablation_probs[:, :, top_10_tensor].mean(dim=-1)  # [batch, seq-1]
+
+                relative_decrease = (clean_top10_probs - ablated_top10_probs) / (clean_top10_probs + 1e-10)  # [batch, seq-1]
+                relative_decrease_masked = relative_decrease[mask_2d]
+                top10_prob_decreases.extend(relative_decrease_masked.cpu().tolist())
+
+                # Find max decrease in this batch for snippet
+                for b_idx in range(len(batch_tokens)):
+                    seq_len = mask_2d[b_idx].sum().item()
+                    for pos_idx in range(seq_len):
+                        decrease = relative_decrease[b_idx, pos_idx].item()
+                        if decrease > max_decrease:
+                            max_decrease = decrease
+                            passage_idx = batch_start + b_idx
+                            max_decrease_info = {
+                                'passage_idx': passage_idx,
+                                'text': test_texts[passage_idx],
+                                'tokens': batch_tokens[b_idx],
+                                'position': pos_idx,
+                                'decrease': decrease,
+                                'clean_prob': clean_top10_probs[b_idx, pos_idx].item(),
+                                'ablated_prob': ablated_top10_probs[b_idx, pos_idx].item()
+                            }
+
+        # Compute averages
+        avg_d_loss = np.mean(ablation_losses) - np.mean(clean_losses)
+        avg_kl = np.mean(kls)
+        avg_top10_decrease = np.mean(top10_prob_decreases)
 
         logger.info(
             f"  Layer {layer}, Feature {feat_id}: "
-            f"clean={avg_clean:.4f}, ablation={avg_ablation:.4f}, "
-            f"d_loss={d_loss:.4f}"
+            f"d_loss={avg_d_loss:.4f}, KL={avg_kl:.4f}, top10_decrease={avg_top10_decrease:.4f}"
         )
 
-        d_losses.append(d_loss)
+        d_losses.append(avg_d_loss)
+        kl_divs.append(avg_kl)
+        top10_decreases.append(avg_top10_decrease)
+        snippets_per_layer[layer][feat_id] = {
+            'top_10_tokens': top_10_tokens,
+            'top_10_token_strings': [model.tokenizer.decode([t]) for t in top_10_tokens],
+            'max_decrease_info': max_decrease_info
+        }
 
-    results_per_layer[layer] = d_losses
+    results_per_layer[layer] = {
+        'd_loss': d_losses,
+        'kl': kl_divs,
+        'top10_decrease': top10_decreases
+    }
 
 # ============================================================================
-# Step 5: Compute statistics and plot
+# Step 5: Compute statistics and generate plots
 # ============================================================================
-logger.info("Step 5: Computing statistics and generating plot...")
+logger.info("Step 5: Computing statistics and generating plots...")
 
+# Collect statistics for each metric
 layers = []
 mean_d_losses = []
-ci_lows = []
-ci_highs = []
+mean_kls = []
+mean_top10_decreases = []
+
+d_loss_cis = []
+kl_cis = []
+top10_cis = []
 
 for layer in config["layers"]:
-    d_losses = results_per_layer[layer]
+    results = results_per_layer[layer]
 
+    # D-loss statistics
+    d_losses = results['d_loss']
     mean_d_loss = np.mean(d_losses)
     std_d_loss = np.std(d_losses, ddof=1)
     n = len(d_losses)
+    ci_d_loss = 1.96 * (std_d_loss / np.sqrt(n))
 
-    # 95% CI: mean ± 1.96 * (std / sqrt(n))
-    ci = 1.96 * (std_d_loss / np.sqrt(n))
+    # KL statistics
+    kls = results['kl']
+    mean_kl = np.mean(kls)
+    std_kl = np.std(kls, ddof=1)
+    ci_kl = 1.96 * (std_kl / np.sqrt(n))
+
+    # Top-10 decrease statistics
+    top10s = results['top10_decrease']
+    mean_top10 = np.mean(top10s)
+    std_top10 = np.std(top10s, ddof=1)
+    ci_top10 = 1.96 * (std_top10 / np.sqrt(n))
 
     layers.append(layer)
     mean_d_losses.append(mean_d_loss)
-    ci_lows.append(mean_d_loss - ci)
-    ci_highs.append(mean_d_loss + ci)
+    mean_kls.append(mean_kl)
+    mean_top10_decreases.append(mean_top10)
+
+    d_loss_cis.append((mean_d_loss - ci_d_loss, mean_d_loss + ci_d_loss))
+    kl_cis.append((mean_kl - ci_kl, mean_kl + ci_kl))
+    top10_cis.append((mean_top10 - ci_top10, mean_top10 + ci_top10))
 
     logger.info(
-        f"Layer {layer}: mean d_loss = {mean_d_loss:.4f}, "
-        f"95% CI = [{mean_d_loss - ci:.4f}, {mean_d_loss + ci:.4f}]"
+        f"Layer {layer}: d_loss={mean_d_loss:.4f}, KL={mean_kl:.4f}, top10_decrease={mean_top10:.4f}"
     )
 
-# Create plot
-plt.figure(figsize=(10, 6))
-plt.errorbar(
-    layers,
-    mean_d_losses,
-    yerr=[
-        np.array(mean_d_losses) - np.array(ci_lows),
-        np.array(ci_highs) - np.array(mean_d_losses)
-    ],
-    fmt='o-',
-    capsize=5,
-    capthick=2,
-    markersize=8,
-    linewidth=2,
-    label='Mean Δ Loss (top 5 features)'
-)
+# Create 3-panel plot
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-plt.xlabel('Layer', fontsize=14)
-plt.ylabel('Mean Δ Loss (ablation effect)', fontsize=14)
-plt.title('Effect of Ablating Top 5 Most Active Features per Layer', fontsize=16)
-plt.grid(True, alpha=0.3)
-plt.legend(fontsize=12)
-plt.xticks(layers)
+# Plot 1: D-Loss
+ax = axes[0]
+d_loss_errs = [[mean_d_losses[i] - d_loss_cis[i][0] for i in range(len(layers))],
+               [d_loss_cis[i][1] - mean_d_losses[i] for i in range(len(layers))]]
+ax.errorbar(layers, mean_d_losses, yerr=d_loss_errs, fmt='o-', capsize=5, capthick=2, markersize=8, linewidth=2)
+ax.set_xlabel('Layer', fontsize=12)
+ax.set_ylabel('Mean Δ Loss', fontsize=12)
+ax.set_title('Ablation Effect: Δ Loss', fontsize=14)
+ax.grid(True, alpha=0.3)
+ax.set_xticks(layers)
+
+# Plot 2: KL Divergence
+ax = axes[1]
+kl_errs = [[mean_kls[i] - kl_cis[i][0] for i in range(len(layers))],
+           [kl_cis[i][1] - mean_kls[i] for i in range(len(layers))]]
+ax.errorbar(layers, mean_kls, yerr=kl_errs, fmt='o-', capsize=5, capthick=2, markersize=8, linewidth=2, color='orange')
+ax.set_xlabel('Layer', fontsize=12)
+ax.set_ylabel('Mean KL Divergence', fontsize=12)
+ax.set_title('KL(P_clean || P_ablated)', fontsize=14)
+ax.grid(True, alpha=0.3)
+ax.set_xticks(layers)
+
+# Plot 3: Top-10 Token Probability Decrease
+ax = axes[2]
+top10_errs = [[mean_top10_decreases[i] - top10_cis[i][0] for i in range(len(layers))],
+              [top10_cis[i][1] - mean_top10_decreases[i] for i in range(len(layers))]]
+ax.errorbar(layers, mean_top10_decreases, yerr=top10_errs, fmt='o-', capsize=5, capthick=2, markersize=8, linewidth=2, color='green')
+ax.set_xlabel('Layer', fontsize=12)
+ax.set_ylabel('Relative Probability Decrease', fontsize=12)
+ax.set_title('Top-10 Token Prob Decrease', fontsize=14)
+ax.grid(True, alpha=0.3)
+ax.set_xticks(layers)
+
 plt.tight_layout()
 
 # Save plot
 output_dir = Path("outputs/plots")
 output_dir.mkdir(parents=True, exist_ok=True)
-output_path = output_dir / "top_features_by_layer.png"
+output_path = output_dir / "top_features_metrics_by_layer.png"
 plt.savefig(output_path, dpi=300, bbox_inches='tight')
 logger.info(f"Saved plot to {output_path}")
+plt.close()
 
-# Save data
+# Save CSV data
 import csv
-csv_path = Path("outputs/csv") / "top_features_by_layer.csv"
+csv_path = Path("outputs/csv") / "top_features_metrics_by_layer.csv"
 csv_path.parent.mkdir(parents=True, exist_ok=True)
 
 with open(csv_path, 'w', newline='') as f:
     writer = csv.writer(f)
-    writer.writerow(['layer', 'mean_d_loss', 'ci_low', 'ci_high', 'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5'])
+    writer.writerow([
+        'layer',
+        'mean_d_loss', 'd_loss_ci_low', 'd_loss_ci_high',
+        'mean_kl', 'kl_ci_low', 'kl_ci_high',
+        'mean_top10_decrease', 'top10_ci_low', 'top10_ci_high',
+        'feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5'
+    ])
 
     for layer in config["layers"]:
         top_features = [str(feat_id) for feat_id, _ in top_features_per_layer[layer]]
         idx = layers.index(layer)
         writer.writerow([
             layer,
-            mean_d_losses[idx],
-            ci_lows[idx],
-            ci_highs[idx],
+            mean_d_losses[idx], d_loss_cis[idx][0], d_loss_cis[idx][1],
+            mean_kls[idx], kl_cis[idx][0], kl_cis[idx][1],
+            mean_top10_decreases[idx], top10_cis[idx][0], top10_cis[idx][1],
             *top_features
         ])
 
 logger.info(f"Saved data to {csv_path}")
+
+# ============================================================================
+# Step 6: Save snippets
+# ============================================================================
+logger.info("Step 6: Saving snippets...")
+
+snippets_dir = Path("outputs/snippets")
+snippets_dir.mkdir(parents=True, exist_ok=True)
+
+for layer in config["layers"]:
+    layer_dir = snippets_dir / f"layer_{layer}"
+    layer_dir.mkdir(exist_ok=True)
+
+    for feat_id, snippet_data in snippets_per_layer[layer].items():
+        max_info = snippet_data['max_decrease_info']
+
+        if max_info is None:
+            continue
+
+        # Create snippet file
+        snippet_path = layer_dir / f"feature_{feat_id}_max_decrease.txt"
+
+        with open(snippet_path, 'w') as f:
+            f.write(f"Layer {layer}, Feature {feat_id}\n")
+            f.write("=" * 80 + "\n\n")
+
+            f.write(f"Top-10 Output Tokens:\n")
+            for i, token_str in enumerate(snippet_data['top_10_token_strings'], 1):
+                f.write(f"  {i}. {repr(token_str)}\n")
+            f.write("\n")
+
+            f.write(f"Maximum Probability Decrease: {max_info['decrease']:.4f}\n")
+            f.write(f"  Clean prob (top-10 avg): {max_info['clean_prob']:.6f}\n")
+            f.write(f"  Ablated prob (top-10 avg): {max_info['ablated_prob']:.6f}\n")
+            f.write(f"  Relative decrease: {max_info['decrease']:.2%}\n\n")
+
+            f.write(f"Context (position {max_info['position']} in passage):\n")
+            f.write("-" * 80 + "\n")
+
+            # Decode tokens with context window
+            tokens = max_info['tokens'].cpu().tolist()
+            pos = max_info['position']
+
+            # Context: 10 tokens before and after
+            context_start = max(0, pos - 10)
+            context_end = min(len(tokens), pos + 11)
+
+            context_tokens = tokens[context_start:context_end]
+            context_text = model.tokenizer.decode(context_tokens)
+
+            # Highlight the position
+            before_text = model.tokenizer.decode(tokens[context_start:pos+1])
+            target_token = model.tokenizer.decode([tokens[pos+1]]) if pos+1 < len(tokens) else ""
+            after_text = model.tokenizer.decode(tokens[pos+2:context_end]) if pos+2 < len(tokens) else ""
+
+            f.write(f"{before_text}[{target_token}]{after_text}\n")
+            f.write("-" * 80 + "\n\n")
+
+            f.write("Full passage:\n")
+            f.write(max_info['text'][:500])  # First 500 chars
+            if len(max_info['text']) > 500:
+                f.write("...")
+            f.write("\n")
+
+logger.info(f"Saved snippets to {snippets_dir}")
 logger.info("Analysis complete!")
