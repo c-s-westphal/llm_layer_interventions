@@ -500,14 +500,11 @@ def measure_probability_changes(
     batch_size: int,
     tokenizer,
     activation_threshold: float = 0.0,
-    prob_sum_threshold: float = 0.05,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
     """Measure probability changes on feature-specific top tokens when ablating a feature.
 
-    Only measures on positions where:
-    1. Feature activation exceeds the activation_threshold
-    2. Sum of baseline probabilities for top tokens exceeds prob_sum_threshold
+    Only measures on positions where feature activation exceeds the activation_threshold.
 
     Args:
         model: HookedTransformer model
@@ -516,11 +513,10 @@ def measure_probability_changes(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        top_tokens: List of feature-specific token IDs (from logit lens)
+        top_tokens: List of feature-specific token IDs (empirically discovered)
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         activation_threshold: Only measure on positions where feature > threshold
-        prob_sum_threshold: Only measure where baseline top-token probability sum > threshold
         logger: Logger instance
 
     Returns:
@@ -528,7 +524,7 @@ def measure_probability_changes(
     """
     logger = logger or logging.getLogger("ablation_intervention")
     logger.info(f"  Measuring probability changes on feature {feature_id}'s top-{len(top_tokens)} tokens")
-    logger.info(f"    Filters: activation > {activation_threshold:.4f}, prob_sum > {prob_sum_threshold:.2f}")
+    logger.info(f"    Filter: activation > {activation_threshold:.4f}")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
@@ -536,8 +532,6 @@ def measure_probability_changes(
     all_relative_changes = []
     total_positions = 0
     positions_active = 0
-    positions_prob_sum = 0
-    positions_both = 0
 
     num_batches = (len(data) + batch_size - 1) // batch_size
 
@@ -584,17 +578,14 @@ def measure_probability_changes(
         # Compute relative change: (baseline - ablated) / baseline
         relative_change = (baseline_top_probs_sum - ablated_top_probs_sum) / (baseline_top_probs_sum + 1e-10)
 
-        # Create masks
+        # Create mask: only positions where feature is active
         attention_mask = batch_dict["attention_mask"][:, 1:].bool()
         active_mask = feature_acts[:, :-1] > activation_threshold
-        prob_sum_mask = baseline_top_probs_sum > prob_sum_threshold
-        combined_mask = attention_mask & active_mask & prob_sum_mask
+        combined_mask = attention_mask & active_mask
 
         # Track filter statistics
         total_positions += attention_mask.sum().item()
-        positions_active += (attention_mask & active_mask).sum().item()
-        positions_prob_sum += (attention_mask & prob_sum_mask).sum().item()
-        positions_both += combined_mask.sum().item()
+        positions_active += combined_mask.sum().item()
 
         # Collect valid AND active positions
         if combined_mask.sum() > 0:
@@ -605,12 +596,10 @@ def measure_probability_changes(
     logger.info(f"  Filter statistics:")
     logger.info(f"    Total valid positions: {total_positions}")
     logger.info(f"    Positions with activation > {activation_threshold:.4f}: {positions_active} ({100*positions_active/max(total_positions,1):.1f}%)")
-    logger.info(f"    Positions with prob_sum > {prob_sum_threshold:.2f}: {positions_prob_sum} ({100*positions_prob_sum/max(total_positions,1):.1f}%)")
-    logger.info(f"    Positions passing both filters: {positions_both} ({100*positions_both/max(total_positions,1):.1f}%)")
 
     # Concatenate all changes
     if len(all_relative_changes) == 0:
-        logger.warning(f"  No positions passed both filters for feature {feature_id}")
+        logger.warning(f"  No positions with active feature for feature {feature_id}")
         stats = {
             "mean": 0.0,
             "median": 0.0,
@@ -619,9 +608,7 @@ def measure_probability_changes(
             "max": 0.0,
             "q25": 0.0,
             "q75": 0.0,
-            "num_qualifying_positions": 0,
-            "num_active_positions": positions_active,
-            "num_prob_sum_positions": positions_prob_sum
+            "num_active_positions": 0
         }
     else:
         all_changes = np.concatenate(all_relative_changes)
@@ -635,12 +622,10 @@ def measure_probability_changes(
             "max": float(np.max(all_changes)),
             "q25": float(np.percentile(all_changes, 25)),
             "q75": float(np.percentile(all_changes, 75)),
-            "num_qualifying_positions": positions_both,
-            "num_active_positions": positions_active,
-            "num_prob_sum_positions": positions_prob_sum
+            "num_active_positions": positions_active
         }
 
-        logger.info(f"  Probability change statistics on {positions_both} qualifying positions:")
+        logger.info(f"  Probability change statistics on {positions_active} active positions:")
         logger.info(f"    Mean: {stats['mean']:.4f}")
         logger.info(f"    Median: {stats['median']:.4f}")
         logger.info(f"    Std: {stats['std']:.4f}")
@@ -783,7 +768,6 @@ def measure_probability_changes_random_control(
     batch_size: int,
     tokenizer,
     activation_threshold: float = 0.0,
-    prob_sum_threshold: float = 0.05,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
     """Measure probability changes when ablating a RANDOM feature (control).
@@ -801,7 +785,6 @@ def measure_probability_changes_random_control(
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         activation_threshold: Only measure on positions where TARGET feature > threshold
-        prob_sum_threshold: Only measure where baseline top-token probability sum > threshold
         logger: Logger instance
 
     Returns:
@@ -815,13 +798,13 @@ def measure_probability_changes_random_control(
     while random_feature_id == feature_id:
         random_feature_id = np.random.randint(0, d_sae)
 
-    logger.info(f"  Control: Ablating RANDOM feature {random_feature_id} (same filters as target)")
+    logger.info(f"  Control: Ablating RANDOM feature {random_feature_id} (same filter as target)")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
 
     all_relative_changes = []
-    positions_both = 0
+    positions_active = 0
 
     num_batches = (len(data) + batch_size - 1) // batch_size
 
@@ -868,13 +851,12 @@ def measure_probability_changes_random_control(
         # Compute relative change: (baseline - ablated) / baseline
         relative_change = (baseline_top_probs_sum - ablated_top_probs_sum) / (baseline_top_probs_sum + 1e-10)
 
-        # Create mask: same filters as target (TARGET feature active AND prob_sum > threshold)
+        # Create mask: same filter as target (TARGET feature active)
         attention_mask = batch_dict["attention_mask"][:, 1:].bool()
         active_mask = target_feature_acts[:, :-1] > activation_threshold
-        prob_sum_mask = baseline_top_probs_sum > prob_sum_threshold
-        combined_mask = attention_mask & active_mask & prob_sum_mask
+        combined_mask = attention_mask & active_mask
 
-        positions_both += combined_mask.sum().item()
+        positions_active += combined_mask.sum().item()
 
         # Collect valid AND active positions
         if combined_mask.sum() > 0:
@@ -883,7 +865,7 @@ def measure_probability_changes_random_control(
 
     # Concatenate all changes
     if len(all_relative_changes) == 0:
-        logger.warning(f"  Control: No positions passed filters")
+        logger.warning(f"  Control: No active positions")
         stats = {
             "mean": 0.0,
             "median": 0.0,
@@ -892,7 +874,7 @@ def measure_probability_changes_random_control(
             "max": 0.0,
             "q25": 0.0,
             "q75": 0.0,
-            "num_qualifying_positions": 0
+            "num_active_positions": 0
         }
     else:
         all_changes = np.concatenate(all_relative_changes)
@@ -906,10 +888,10 @@ def measure_probability_changes_random_control(
             "max": float(np.max(all_changes)),
             "q25": float(np.percentile(all_changes, 25)),
             "q75": float(np.percentile(all_changes, 75)),
-            "num_qualifying_positions": positions_both
+            "num_active_positions": positions_active
         }
 
-        logger.info(f"  Control: Mean={stats['mean']:.4f}, Median={stats['median']:.4f} (on {positions_both} positions)")
+        logger.info(f"  Control: Mean={stats['mean']:.4f}, Median={stats['median']:.4f} (on {positions_active} positions)")
 
     return stats
 
@@ -1148,7 +1130,6 @@ def main():
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            prob_sum_threshold=0.05,
             logger=logger
         )
 
@@ -1189,7 +1170,6 @@ def main():
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            prob_sum_threshold=0.05,
             logger=logger
         )
 
@@ -1248,7 +1228,6 @@ def main():
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            prob_sum_threshold=0.05,
             logger=logger
         )
 
@@ -1293,7 +1272,6 @@ def main():
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            prob_sum_threshold=0.05,
             logger=logger
         )
 
