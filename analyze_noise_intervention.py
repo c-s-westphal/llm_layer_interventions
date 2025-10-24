@@ -1,7 +1,7 @@
-"""Analyze SAE feature interventions using noise-based KLD targeting.
+"""Analyze SAE feature interventions using ablation.
 
-Instead of ablating features entirely, this script adds calibrated noise to features
-until reaching a target KLD threshold, then measures probability changes on important tokens.
+This script ablates (zeros out) features in SAE latent space, measures the KLD,
+and analyzes probability changes on important tokens.
 """
 
 import os
@@ -24,11 +24,11 @@ from src.model import ModelLoader
 
 def setup_logging(output_dir: Path) -> logging.Logger:
     """Setup logging to both file and console."""
-    logger = logging.getLogger("noise_intervention")
+    logger = logging.getLogger("ablation_intervention")
     logger.setLevel(logging.INFO)
 
     # File handler
-    fh = logging.FileHandler(output_dir / "noise_intervention.log")
+    fh = logging.FileHandler(output_dir / "ablation_intervention.log")
     fh.setLevel(logging.INFO)
 
     # Console handler
@@ -67,7 +67,7 @@ def find_top_tokens_by_probability(
     Returns:
         List of token IDs
     """
-    logger = logger or logging.getLogger("noise_intervention")
+    logger = logger or logging.getLogger("ablation_intervention")
     logger.info(f"Finding top-{top_k} tokens by actual probability...")
 
     sample_size = min(sample_size, len(data))
@@ -126,7 +126,7 @@ def get_mean_activation(
     Returns:
         Tuple of (mean_activation, std_activation)
     """
-    logger = logger or logging.getLogger("noise_intervention")
+    logger = logger or logging.getLogger("ablation_intervention")
     logger.info(f"Computing activation statistics for layer {layer}, feature {feature_id}...")
 
     all_activations = []
@@ -188,13 +188,12 @@ def compute_kl_divergence(
     return kl_mean.item()
 
 
-def create_noise_hook(sae, feature_id: int, noise_percentage: float):
-    """Create a hook that adds Gaussian noise proportional to actual activation.
+def create_ablation_hook(sae, feature_id: int):
+    """Create a hook that ablates (zeros out) a specific feature.
 
     Args:
         sae: SAE instance
-        feature_id: Feature ID to add noise to
-        noise_percentage: Percentage of activation to use as noise std (e.g., 0.05 = 5%)
+        feature_id: Feature ID to ablate
 
     Returns:
         Hook function
@@ -203,12 +202,8 @@ def create_noise_hook(sae, feature_id: int, noise_percentage: float):
         # Encode to SAE latent space
         sae_acts = sae.encode(activations)  # [batch, seq, d_sae]
 
-        # Add Gaussian noise proportional to actual activation at each position
-        # If activation is 100 and noise_percentage=0.05, adds N(0, 5) noise
-        # If activation is 0, adds no noise
-        feature_acts = sae_acts[:, :, feature_id]  # [batch, seq]
-        noise = torch.randn_like(feature_acts) * noise_percentage * torch.abs(feature_acts)
-        sae_acts[:, :, feature_id] = feature_acts + noise
+        # Ablate the feature (set to 0)
+        sae_acts[:, :, feature_id] = 0.0
 
         # Decode back
         modified_acts = sae.decode(sae_acts)
@@ -239,22 +234,19 @@ def create_reconstruction_hook(sae):
     return hook_fn
 
 
-def calibrate_noise_for_kld(
+def measure_kld_with_ablation(
     model,
     sae,
     layer: int,
     feature_id: int,
     hook: str,
     data: List[torch.Tensor],
-    target_kld: float,
     batch_size: int,
-    max_iterations: int = 20,
-    tolerance: float = 0.01,
     logger: logging.Logger = None
-) -> Tuple[float, float]:
-    """Find noise percentage that achieves target KLD using binary search.
+) -> float:
+    """Measure KLD when ablating a feature.
 
-    Compares reconstructed baseline to noisy (not clean to noisy).
+    Compares reconstructed baseline to ablated.
 
     Args:
         model: HookedTransformer model
@@ -263,76 +255,47 @@ def calibrate_noise_for_kld(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        target_kld: Target KLD value
         batch_size: Batch size
-        max_iterations: Maximum search iterations
-        tolerance: KLD tolerance
         logger: Logger instance
 
     Returns:
-        Tuple of (noise_percentage, achieved_kld)
+        KLD value
     """
-    logger = logger or logging.getLogger("noise_intervention")
+    logger = logger or logging.getLogger("ablation_intervention")
     hook_name = f"blocks.{layer}.hook_{hook}"
 
-    # Binary search bounds
-    noise_low = 0.0
-    noise_high = 5.0  # Start with 500% max
+    logger.info(f"  Measuring KLD from ablating feature {feature_id}...")
 
-    logger.info(f"Calibrating noise for layer {layer}, feature {feature_id} (target KLD={target_kld})...")
+    # Measure KLD on first batch
+    batch_tokens = data[:batch_size]
+    batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-    for iteration in range(max_iterations):
-        noise_percentage = (noise_low + noise_high) / 2.0
+    # Baseline: SAE reconstruction without ablation
+    reconstruction_hook = create_reconstruction_hook(sae)
 
-        # Measure KLD at this noise level
-        batch_tokens = data[:batch_size]
-        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+    with torch.no_grad():
+        baseline_logits = model.run_with_hooks(
+            batch_dict["input_ids"],
+            fwd_hooks=[(hook_name, reconstruction_hook)]
+        )
+        baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
 
-        # Baseline: SAE reconstruction without noise
-        reconstruction_hook = create_reconstruction_hook(sae)
+    # Ablated: SAE reconstruction WITH feature ablated
+    ablation_hook = create_ablation_hook(sae, feature_id)
 
-        with torch.no_grad():
-            baseline_logits = model.run_with_hooks(
-                batch_dict["input_ids"],
-                fwd_hooks=[(hook_name, reconstruction_hook)]
-            )
-            baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+    with torch.no_grad():
+        ablated_logits = model.run_with_hooks(
+            batch_dict["input_ids"],
+            fwd_hooks=[(hook_name, ablation_hook)]
+        )
+        ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
-        # Noisy: SAE reconstruction WITH noise
-        noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
+    # Compute KLD
+    mask = batch_dict["attention_mask"][:, 1:]
+    kld = compute_kl_divergence(baseline_probs, ablated_probs, mask)
 
-        with torch.no_grad():
-            noisy_logits = model.run_with_hooks(
-                batch_dict["input_ids"],
-                fwd_hooks=[(hook_name, noise_hook)]
-            )
-            noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
-
-        # Compute KLD
-        mask = batch_dict["attention_mask"][:, 1:]
-        kld = compute_kl_divergence(baseline_probs, noisy_probs, mask)
-
-        logger.info(f"  Iteration {iteration+1}: noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-
-        # Check convergence
-        if abs(kld - target_kld) < tolerance:
-            logger.info(f"  Converged! Final noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-            return noise_percentage, kld
-
-        # Update search bounds
-        if kld < target_kld:
-            # Need more noise
-            noise_low = noise_percentage
-            # If hitting upper bound, expand range
-            if noise_percentage > 0.95 * noise_high:
-                noise_high *= 2.0
-                logger.info(f"  Expanding search range to {noise_high*100:.0f}%")
-        else:
-            noise_high = noise_percentage
-
-    # Max iterations reached
-    logger.warning(f"  Max iterations reached. Best noise={noise_percentage:.4f} ({noise_percentage*100:.1f}%), KLD={kld:.4f}")
-    return noise_percentage, kld
+    logger.info(f"  KLD from ablation: {kld:.4f}")
+    return kld
 
 
 def measure_probability_changes(
@@ -343,12 +306,11 @@ def measure_probability_changes(
     hook: str,
     data: List[torch.Tensor],
     top_tokens: List[int],
-    noise_percentage: float,
     batch_size: int,
     tokenizer,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
-    """Measure probability changes on top tokens at given noise percentage.
+    """Measure probability changes on top tokens when ablating a feature.
 
     Args:
         model: HookedTransformer model
@@ -358,7 +320,6 @@ def measure_probability_changes(
         hook: Hook type
         data: List of token tensors
         top_tokens: List of important token IDs
-        noise_percentage: Calibrated noise percentage
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         logger: Logger instance
@@ -366,8 +327,8 @@ def measure_probability_changes(
     Returns:
         Dictionary with statistics (mean, median, etc.)
     """
-    logger = logger or logging.getLogger("noise_intervention")
-    logger.info(f"  Measuring probability changes on TARGET feature {feature_id} with {noise_percentage*100:.1f}% noise...")
+    logger = logger or logging.getLogger("ablation_intervention")
+    logger.info(f"  Measuring probability changes on TARGET feature {feature_id} (ablation)...")
 
     # Log which tokens we're analyzing
     logger.info(f"  Analyzing probability changes for tokens:")
@@ -388,7 +349,7 @@ def measure_probability_changes(
         batch_tokens = data[batch_start:batch_end]
         batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-        # Baseline: SAE reconstruction without noise
+        # Baseline: SAE reconstruction without ablation
         reconstruction_hook = create_reconstruction_hook(sae)
 
         with torch.no_grad():
@@ -398,23 +359,23 @@ def measure_probability_changes(
             )
             baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
 
-        # Noisy: SAE reconstruction WITH noise on target feature
-        noise_hook = create_noise_hook(sae, feature_id, noise_percentage)
+        # Ablated: SAE reconstruction WITH feature ablated
+        ablation_hook = create_ablation_hook(sae, feature_id)
 
         with torch.no_grad():
-            noisy_logits = model.run_with_hooks(
+            ablated_logits = model.run_with_hooks(
                 batch_dict["input_ids"],
-                fwd_hooks=[(hook_name, noise_hook)]
+                fwd_hooks=[(hook_name, ablation_hook)]
             )
-            noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
+            ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
         # Extract probabilities for top tokens
         baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
-        noisy_top_probs = noisy_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        ablated_top_probs = ablated_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
 
-        # Compute relative change: (baseline - noisy) / baseline
+        # Compute relative change: (baseline - ablated) / baseline
         mask = batch_dict["attention_mask"][:, 1:].bool()
-        relative_change = (baseline_top_probs - noisy_top_probs) / (baseline_top_probs + 1e-10)
+        relative_change = (baseline_top_probs - ablated_top_probs) / (baseline_top_probs + 1e-10)
 
         # Collect valid positions
         valid_changes = relative_change[mask].cpu().numpy()
@@ -451,12 +412,11 @@ def measure_probability_changes_random_control(
     hook: str,
     data: List[torch.Tensor],
     top_tokens: List[int],
-    noise_percentage: float,
     batch_size: int,
     tokenizer,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
-    """Measure probability changes when adding noise to a RANDOM feature (control).
+    """Measure probability changes when ablating a RANDOM feature (control).
 
     Args:
         model: HookedTransformer model
@@ -466,7 +426,6 @@ def measure_probability_changes_random_control(
         hook: Hook type
         data: List of token tensors
         top_tokens: Same top-10 tokens as target measurement
-        noise_percentage: Same noise percentage
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         logger: Logger instance
@@ -474,7 +433,7 @@ def measure_probability_changes_random_control(
     Returns:
         Dictionary with statistics (mean, median, etc.)
     """
-    logger = logger or logging.getLogger("noise_intervention")
+    logger = logger or logging.getLogger("ablation_intervention")
 
     # Select a random feature (different from the target)
     d_sae = sae.cfg.d_sae
@@ -497,7 +456,7 @@ def measure_probability_changes_random_control(
         batch_tokens = data[batch_start:batch_end]
         batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-        # Baseline: SAE reconstruction without noise
+        # Baseline: SAE reconstruction without ablation
         reconstruction_hook = create_reconstruction_hook(sae)
 
         with torch.no_grad():
@@ -507,23 +466,23 @@ def measure_probability_changes_random_control(
             )
             baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
 
-        # Noisy: SAE reconstruction WITH noise on RANDOM feature
-        noise_hook = create_noise_hook(sae, random_feature_id, noise_percentage)
+        # Ablated: SAE reconstruction WITH RANDOM feature ablated
+        ablation_hook = create_ablation_hook(sae, random_feature_id)
 
         with torch.no_grad():
-            noisy_logits = model.run_with_hooks(
+            ablated_logits = model.run_with_hooks(
                 batch_dict["input_ids"],
-                fwd_hooks=[(hook_name, noise_hook)]
+                fwd_hooks=[(hook_name, ablation_hook)]
             )
-            noisy_probs = torch.softmax(noisy_logits[:, :-1, :], dim=-1)
+            ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
         # Extract probabilities for SAME top tokens
         baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
-        noisy_top_probs = noisy_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        ablated_top_probs = ablated_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
 
-        # Compute relative change: (baseline - noisy) / baseline
+        # Compute relative change: (baseline - ablated) / baseline
         mask = batch_dict["attention_mask"][:, 1:].bool()
-        relative_change = (baseline_top_probs - noisy_top_probs) / (baseline_top_probs + 1e-10)
+        relative_change = (baseline_top_probs - ablated_top_probs) / (baseline_top_probs + 1e-10)
 
         # Collect valid positions
         valid_changes = relative_change[mask].cpu().numpy()
@@ -551,9 +510,8 @@ def measure_probability_changes_random_control(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Noise-based feature intervention with KLD targeting")
+    parser = argparse.ArgumentParser(description="Ablation-based feature intervention analysis")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--target_kld", type=float, default=0.1, help="Target KLD threshold (reconstructed baseline vs noisy)")
     parser.add_argument("--top_k_activation", type=int, default=5, help="Top K features by activation")
     parser.add_argument("--top_k_interpretability", type=int, default=5, help="Top K features by interpretability")
     args = parser.parse_args()
@@ -567,16 +525,15 @@ def main():
     config["test_passages"] = config.get("test_passages", config["max_passages"])
 
     # Setup output directory
-    output_dir = Path(config["output_dir"]) / "noise_intervention"
+    output_dir = Path(config["output_dir"]) / "ablation_intervention"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logging
     logger = setup_logging(output_dir)
     logger.info("="*80)
-    logger.info("NOISE-BASED FEATURE INTERVENTION WITH KLD TARGETING")
+    logger.info("ABLATION-BASED FEATURE INTERVENTION ANALYSIS")
     logger.info("="*80)
     logger.info(f"Config: {args.config}")
-    logger.info(f"Target KLD: {args.target_kld}")
     logger.info(f"Output directory: {output_dir}")
 
     # Set device
@@ -723,24 +680,23 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Calibrate noise to reach target KLD
-        noise_percentage, achieved_kld = calibrate_noise_for_kld(
+        # Measure KLD from ablation
+        ablation_kld = measure_kld_with_ablation(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, args.target_kld,
-            config["batch_size"], logger=logger
+            calibration_data, config["batch_size"], logger=logger
         )
 
         # Measure probability changes on TARGET feature
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
         # Measure probability changes on RANDOM feature (control)
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -752,8 +708,7 @@ def main():
             "feature_id": feature_id,
             "selection_method": "activation",
             "max_activation": activation,
-            "noise_percentage": noise_percentage,
-            "achieved_kld": achieved_kld,
+            "ablation_kld": ablation_kld,
             **stats,
             **control_stats_prefixed
         })
@@ -770,24 +725,23 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Calibrate noise to reach target KLD
-        noise_percentage, achieved_kld = calibrate_noise_for_kld(
+        # Measure KLD from ablation
+        ablation_kld = measure_kld_with_ablation(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, args.target_kld,
-            config["batch_size"], logger=logger
+            calibration_data, config["batch_size"], logger=logger
         )
 
         # Measure probability changes on TARGET feature
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
         # Measure probability changes on RANDOM feature (control)
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens, noise_percentage,
+            test_data, top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -800,15 +754,14 @@ def main():
             "selection_method": "interpretability",
             "label": label,
             "label_confidence": conf,
-            "noise_percentage": noise_percentage,
-            "achieved_kld": achieved_kld,
+            "ablation_kld": ablation_kld,
             **stats,
             **control_stats_prefixed
         })
 
     # Save results
     results_df = pd.DataFrame(results)
-    results_path = output_dir / "noise_intervention_results.csv"
+    results_path = output_dir / "ablation_intervention_results.csv"
     results_df.to_csv(results_path, index=False)
     logger.info(f"\nResults saved to: {results_path}")
 
@@ -822,15 +775,13 @@ def main():
     activation_results = results_df[results_df["selection_method"] == "activation"]
     logger.info(f"    Mean of means: {activation_results['mean'].mean():.4f}")
     logger.info(f"    Mean of medians: {activation_results['median'].mean():.4f}")
-    logger.info(f"    Mean noise percentage: {activation_results['noise_percentage'].mean()*100:.1f}%")
-    logger.info(f"    Mean achieved KLD: {activation_results['achieved_kld'].mean():.4f}")
+    logger.info(f"    Mean ablation KLD: {activation_results['ablation_kld'].mean():.4f}")
 
     logger.info(f"\n  Interpretability (top {args.top_k_interpretability} per layer):")
     interp_results = results_df[results_df["selection_method"] == "interpretability"]
     logger.info(f"    Mean of means: {interp_results['mean'].mean():.4f}")
     logger.info(f"    Mean of medians: {interp_results['median'].mean():.4f}")
-    logger.info(f"    Mean noise percentage: {interp_results['noise_percentage'].mean()*100:.1f}%")
-    logger.info(f"    Mean achieved KLD: {interp_results['achieved_kld'].mean():.4f}")
+    logger.info(f"    Mean ablation KLD: {interp_results['ablation_kld'].mean():.4f}")
 
     logger.info("\nBy Layer and Feature Type:")
     for layer in sorted(results_df["layer"].unique()):
