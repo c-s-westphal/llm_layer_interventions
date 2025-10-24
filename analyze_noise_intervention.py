@@ -895,13 +895,19 @@ def main():
     features_df = pd.read_csv("data/neuronpedia_features.csv")
 
     # Get top features by activation (we'll compute this from calibration data)
-    logger.info("Finding top features by activation...")
-    feature_activations = {}
+    logger.info("Computing average activations for all features...")
+    feature_avg_activations = {}  # (layer, feature_id) -> avg_activation
+    feature_max_activations = {}  # (layer, feature_id) -> max_activation (kept for logging)
 
     for layer in tqdm(config["layers"], desc="Computing activations"):
         sae = saes[layer]
         hook_name = f"blocks.{layer}.hook_{config['hook']}"
 
+        # Accumulate sums and counts for average
+        activation_sum = None
+        total_positions = 0
+
+        # Track max
         max_acts = []
 
         # Process calibration data
@@ -919,64 +925,91 @@ def main():
                     names_filter=[hook_name]
                 )
                 acts = cache[hook_name]
-                sae_acts = sae.encode(acts)
+                sae_acts = sae.encode(acts)  # [batch, seq, d_sae]
+
+                # Compute average: sum over batch and seq
+                mask = batch_dict["attention_mask"]
+                num_valid = mask.sum().item()
+
+                # Sum activations
+                batch_sum = sae_acts.sum(dim=(0, 1))  # [d_sae]
+                if activation_sum is None:
+                    activation_sum = batch_sum.cpu()
+                else:
+                    activation_sum += batch_sum.cpu()
+                total_positions += num_valid
 
                 # Get max activation per feature across this batch
                 batch_max = sae_acts.reshape(-1, sae_acts.shape[-1]).max(dim=0).values
                 max_acts.append(batch_max.cpu())
 
+        # Compute average activation per feature
+        avg_activations = activation_sum / total_positions
+
         # Overall max per feature
         overall_max = torch.stack(max_acts).max(dim=0).values
 
-        for feature_id in range(overall_max.shape[0]):
-            feature_activations[(layer, feature_id)] = overall_max[feature_id].item()
+        for feature_id in range(avg_activations.shape[0]):
+            feature_avg_activations[(layer, feature_id)] = avg_activations[feature_id].item()
+            feature_max_activations[(layer, feature_id)] = overall_max[feature_id].item()
 
-    # Select top K features by activation PER LAYER
+    # Select top K features by MAX activation PER LAYER
     top_by_activation = []
-    logger.info(f"\nTop {args.top_k_activation} features by activation per layer:")
+    logger.info(f"\nTop {args.top_k_activation} features by max activation per layer:")
     for layer in config["layers"]:
         # Get features for this layer
-        layer_features = {(l, f): act for (l, f), act in feature_activations.items() if l == layer}
+        layer_features = {(l, f): act for (l, f), act in feature_max_activations.items() if l == layer}
         # Sort and take top K
         top_k = sorted(layer_features.items(), key=lambda x: x[1], reverse=True)[:args.top_k_activation]
         top_by_activation.extend(top_k)
 
         logger.info(f"  Layer {layer}:")
         for (l, feature_id), activation in top_k:
-            logger.info(f"    Feature {feature_id}: {activation:.4f}")
+            logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
-    # Select top K features by interpretability PER LAYER (with activation filter)
+    # Select top K features by interpretability PER LAYER (from top 10% by avg activation)
     top_by_interpretability_list = []
-    min_activation_threshold = 5.0  # Require at least some activation
-    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer (min_activation > {min_activation_threshold}):")
+    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer (from top 10% by avg activation):")
     for layer in config["layers"]:
-        # Get features for this layer from CSV
+        # Step 1: Find top 10% threshold by average activation for this layer
+        layer_avg_acts = [act for (l, f), act in feature_avg_activations.items() if l == layer]
+        if len(layer_avg_acts) == 0:
+            logger.info(f"  Layer {layer}: No features found")
+            continue
+
+        top_10_percent_threshold = np.percentile(layer_avg_acts, 90)  # 90th percentile = top 10%
+
+        # Step 2: Get features for this layer from CSV
         layer_features = features_df[features_df["layer"] == layer].copy()
 
-        # Add activation data
+        # Step 3: Add activation data
+        layer_features["avg_activation"] = layer_features.apply(
+            lambda row: feature_avg_activations.get((layer, int(row["feature_id"])), 0.0),
+            axis=1
+        )
         layer_features["max_activation"] = layer_features.apply(
-            lambda row: feature_activations.get((layer, int(row["feature_id"])), 0.0),
+            lambda row: feature_max_activations.get((layer, int(row["feature_id"])), 0.0),
             axis=1
         )
 
-        # Filter by activation threshold
-        layer_features = layer_features[layer_features["max_activation"] > min_activation_threshold]
+        # Step 4: Filter to top 10% by average activation
+        layer_features = layer_features[layer_features["avg_activation"] >= top_10_percent_threshold]
 
-        # Sort by confidence and take top K
+        # Step 5: Sort by confidence and take top K
         top_k = layer_features.nlargest(min(args.top_k_interpretability, len(layer_features)), "label_confidence")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
 
-            logger.info(f"  Layer {layer}:")
+            logger.info(f"  Layer {layer} (top 10% threshold: avg_act >= {top_10_percent_threshold:.4f}):")
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
                     f"conf={row['label_confidence']:.2f}, label='{row['label']}', "
-                    f"max_act={row['max_activation']:.2f}"
+                    f"avg_act={row['avg_activation']:.4f}, max_act={row['max_activation']:.2f}"
                 )
         else:
-            logger.info(f"  Layer {layer}: No features with sufficient activation")
+            logger.info(f"  Layer {layer} (top 10% threshold: avg_act >= {top_10_percent_threshold:.4f}): No labeled features in top 10%")
 
     # Concatenate all layers
     if top_by_interpretability_list:
