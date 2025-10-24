@@ -432,11 +432,14 @@ def measure_probability_changes(
     batch_size: int,
     tokenizer,
     activation_threshold: float = 0.0,
+    prob_sum_threshold: float = 0.05,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
     """Measure probability changes on feature-specific top tokens when ablating a feature.
 
-    Only measures on positions where the feature activation exceeds the threshold.
+    Only measures on positions where:
+    1. Feature activation exceeds the activation_threshold
+    2. Sum of baseline probabilities for top tokens exceeds prob_sum_threshold
 
     Args:
         model: HookedTransformer model
@@ -449,19 +452,24 @@ def measure_probability_changes(
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         activation_threshold: Only measure on positions where feature > threshold
+        prob_sum_threshold: Only measure where baseline top-token probability sum > threshold
         logger: Logger instance
 
     Returns:
         Dictionary with statistics (mean, median, etc.)
     """
     logger = logger or logging.getLogger("ablation_intervention")
-    logger.info(f"  Measuring probability changes on feature {feature_id}'s top-{len(top_tokens)} tokens (threshold={activation_threshold:.4f})...")
+    logger.info(f"  Measuring probability changes on feature {feature_id}'s top-{len(top_tokens)} tokens")
+    logger.info(f"    Filters: activation > {activation_threshold:.4f}, prob_sum > {prob_sum_threshold:.2f}")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
 
     all_relative_changes = []
-    total_active_positions = 0
+    total_positions = 0
+    positions_active = 0
+    positions_prob_sum = 0
+    positions_both = 0
 
     num_batches = (len(data) + batch_size - 1) // batch_size
 
@@ -501,27 +509,40 @@ def measure_probability_changes(
             )
             ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
-        # Extract probabilities for top tokens
-        baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
-        ablated_top_probs = ablated_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        # Extract probabilities for top tokens and compute SUM (not mean)
+        baseline_top_probs_sum = baseline_probs[:, :, top_tokens_tensor].sum(dim=-1)  # [batch, seq]
+        ablated_top_probs_sum = ablated_probs[:, :, top_tokens_tensor].sum(dim=-1)  # [batch, seq]
 
         # Compute relative change: (baseline - ablated) / baseline
-        relative_change = (baseline_top_probs - ablated_top_probs) / (baseline_top_probs + 1e-10)
+        relative_change = (baseline_top_probs_sum - ablated_top_probs_sum) / (baseline_top_probs_sum + 1e-10)
 
-        # Create mask: valid positions AND feature is active
+        # Create masks
         attention_mask = batch_dict["attention_mask"][:, 1:].bool()
         active_mask = feature_acts[:, :-1] > activation_threshold
-        combined_mask = attention_mask & active_mask
+        prob_sum_mask = baseline_top_probs_sum > prob_sum_threshold
+        combined_mask = attention_mask & active_mask & prob_sum_mask
+
+        # Track filter statistics
+        total_positions += attention_mask.sum().item()
+        positions_active += (attention_mask & active_mask).sum().item()
+        positions_prob_sum += (attention_mask & prob_sum_mask).sum().item()
+        positions_both += combined_mask.sum().item()
 
         # Collect valid AND active positions
         if combined_mask.sum() > 0:
             valid_changes = relative_change[combined_mask].cpu().numpy()
             all_relative_changes.append(valid_changes)
-            total_active_positions += combined_mask.sum().item()
+
+    # Log filter statistics
+    logger.info(f"  Filter statistics:")
+    logger.info(f"    Total valid positions: {total_positions}")
+    logger.info(f"    Positions with activation > {activation_threshold:.4f}: {positions_active} ({100*positions_active/max(total_positions,1):.1f}%)")
+    logger.info(f"    Positions with prob_sum > {prob_sum_threshold:.2f}: {positions_prob_sum} ({100*positions_prob_sum/max(total_positions,1):.1f}%)")
+    logger.info(f"    Positions passing both filters: {positions_both} ({100*positions_both/max(total_positions,1):.1f}%)")
 
     # Concatenate all changes
     if len(all_relative_changes) == 0:
-        logger.warning(f"  No active positions found for feature {feature_id} (threshold={activation_threshold:.4f})")
+        logger.warning(f"  No positions passed both filters for feature {feature_id}")
         stats = {
             "mean": 0.0,
             "median": 0.0,
@@ -530,7 +551,9 @@ def measure_probability_changes(
             "max": 0.0,
             "q25": 0.0,
             "q75": 0.0,
-            "num_active_positions": 0
+            "num_qualifying_positions": 0,
+            "num_active_positions": positions_active,
+            "num_prob_sum_positions": positions_prob_sum
         }
     else:
         all_changes = np.concatenate(all_relative_changes)
@@ -544,10 +567,12 @@ def measure_probability_changes(
             "max": float(np.max(all_changes)),
             "q25": float(np.percentile(all_changes, 25)),
             "q75": float(np.percentile(all_changes, 75)),
-            "num_active_positions": total_active_positions
+            "num_qualifying_positions": positions_both,
+            "num_active_positions": positions_active,
+            "num_prob_sum_positions": positions_prob_sum
         }
 
-        logger.info(f"  Feature {feature_id}'s top-{len(top_tokens)} token probability change statistics ({total_active_positions} active positions):")
+        logger.info(f"  Probability change statistics on {positions_both} qualifying positions:")
         logger.info(f"    Mean: {stats['mean']:.4f}")
         logger.info(f"    Median: {stats['median']:.4f}")
         logger.info(f"    Std: {stats['std']:.4f}")
@@ -690,6 +715,7 @@ def measure_probability_changes_random_control(
     batch_size: int,
     tokenizer,
     activation_threshold: float = 0.0,
+    prob_sum_threshold: float = 0.05,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
     """Measure probability changes when ablating a RANDOM feature (control).
@@ -707,6 +733,7 @@ def measure_probability_changes_random_control(
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         activation_threshold: Only measure on positions where TARGET feature > threshold
+        prob_sum_threshold: Only measure where baseline top-token probability sum > threshold
         logger: Logger instance
 
     Returns:
@@ -720,13 +747,13 @@ def measure_probability_changes_random_control(
     while random_feature_id == feature_id:
         random_feature_id = np.random.randint(0, d_sae)
 
-    logger.info(f"  Control: Measuring effects of RANDOM feature {random_feature_id} on feature {feature_id}'s top-{len(top_tokens)} tokens...")
+    logger.info(f"  Control: Ablating RANDOM feature {random_feature_id} (same filters as target)")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
 
     all_relative_changes = []
-    total_active_positions = 0
+    positions_both = 0
 
     num_batches = (len(data) + batch_size - 1) // batch_size
 
@@ -766,27 +793,29 @@ def measure_probability_changes_random_control(
             )
             ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
-        # Extract probabilities for SAME top tokens
-        baseline_top_probs = baseline_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
-        ablated_top_probs = ablated_probs[:, :, top_tokens_tensor].mean(dim=-1)  # [batch, seq]
+        # Extract probabilities for SAME top tokens and compute SUM (not mean)
+        baseline_top_probs_sum = baseline_probs[:, :, top_tokens_tensor].sum(dim=-1)  # [batch, seq]
+        ablated_top_probs_sum = ablated_probs[:, :, top_tokens_tensor].sum(dim=-1)  # [batch, seq]
 
         # Compute relative change: (baseline - ablated) / baseline
-        relative_change = (baseline_top_probs - ablated_top_probs) / (baseline_top_probs + 1e-10)
+        relative_change = (baseline_top_probs_sum - ablated_top_probs_sum) / (baseline_top_probs_sum + 1e-10)
 
-        # Create mask: valid positions AND TARGET feature is active (fair comparison)
+        # Create mask: same filters as target (TARGET feature active AND prob_sum > threshold)
         attention_mask = batch_dict["attention_mask"][:, 1:].bool()
         active_mask = target_feature_acts[:, :-1] > activation_threshold
-        combined_mask = attention_mask & active_mask
+        prob_sum_mask = baseline_top_probs_sum > prob_sum_threshold
+        combined_mask = attention_mask & active_mask & prob_sum_mask
+
+        positions_both += combined_mask.sum().item()
 
         # Collect valid AND active positions
         if combined_mask.sum() > 0:
             valid_changes = relative_change[combined_mask].cpu().numpy()
             all_relative_changes.append(valid_changes)
-            total_active_positions += combined_mask.sum().item()
 
     # Concatenate all changes
     if len(all_relative_changes) == 0:
-        logger.warning(f"  No active positions found for control (threshold={activation_threshold:.4f})")
+        logger.warning(f"  Control: No positions passed filters")
         stats = {
             "mean": 0.0,
             "median": 0.0,
@@ -794,7 +823,8 @@ def measure_probability_changes_random_control(
             "min": 0.0,
             "max": 0.0,
             "q25": 0.0,
-            "q75": 0.0
+            "q75": 0.0,
+            "num_qualifying_positions": 0
         }
     else:
         all_changes = np.concatenate(all_relative_changes)
@@ -807,12 +837,11 @@ def measure_probability_changes_random_control(
             "min": float(np.min(all_changes)),
             "max": float(np.max(all_changes)),
             "q25": float(np.percentile(all_changes, 25)),
-            "q75": float(np.percentile(all_changes, 75))
+            "q75": float(np.percentile(all_changes, 75)),
+            "num_qualifying_positions": positions_both
         }
 
-        logger.info(f"  Control (random feature {random_feature_id}) on same {total_active_positions} positions:")
-        logger.info(f"    Mean: {stats['mean']:.4f}")
-        logger.info(f"    Median: {stats['median']:.4f}")
+        logger.info(f"  Control: Mean={stats['mean']:.4f}, Median={stats['median']:.4f} (on {positions_both} positions)")
 
     return stats
 
@@ -967,22 +996,18 @@ def main():
         for (l, feature_id), activation in top_k:
             logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
-    # Select top K features by interpretability PER LAYER (from top 10% by avg activation)
+    # Select top K features by interpretability PER LAYER (no activation filter)
     top_by_interpretability_list = []
-    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer (from top 10% by avg activation):")
+    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer (no activation filter):")
     for layer in config["layers"]:
-        # Step 1: Find top 10% threshold by average activation for this layer
-        layer_avg_acts = [act for (l, f), act in feature_avg_activations.items() if l == layer]
-        if len(layer_avg_acts) == 0:
-            logger.info(f"  Layer {layer}: No features found")
-            continue
-
-        top_10_percent_threshold = np.percentile(layer_avg_acts, 90)  # 90th percentile = top 10%
-
-        # Step 2: Get features for this layer from CSV
+        # Get features for this layer from CSV
         layer_features = features_df[features_df["layer"] == layer].copy()
 
-        # Step 3: Add activation data
+        if len(layer_features) == 0:
+            logger.info(f"  Layer {layer}: No labeled features found")
+            continue
+
+        # Add activation data for logging purposes
         layer_features["avg_activation"] = layer_features.apply(
             lambda row: feature_avg_activations.get((layer, int(row["feature_id"])), 0.0),
             axis=1
@@ -992,16 +1017,13 @@ def main():
             axis=1
         )
 
-        # Step 4: Filter to top 10% by average activation
-        layer_features = layer_features[layer_features["avg_activation"] >= top_10_percent_threshold]
-
-        # Step 5: Sort by confidence and take top K
+        # Sort by confidence and take top K (no activation filtering)
         top_k = layer_features.nlargest(min(args.top_k_interpretability, len(layer_features)), "label_confidence")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
 
-            logger.info(f"  Layer {layer} (top 10% threshold: avg_act >= {top_10_percent_threshold:.4f}):")
+            logger.info(f"  Layer {layer}:")
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
@@ -1009,7 +1031,7 @@ def main():
                     f"avg_act={row['avg_activation']:.4f}, max_act={row['max_activation']:.2f}"
                 )
         else:
-            logger.info(f"  Layer {layer} (top 10% threshold: avg_act >= {top_10_percent_threshold:.4f}): No labeled features in top 10%")
+            logger.info(f"  Layer {layer}: No labeled features found")
 
     # Concatenate all layers
     if top_by_interpretability_list:
@@ -1033,10 +1055,10 @@ def main():
             model, saes[layer], feature_id, top_k=10, logger=logger
         )
 
-        # Calibrate P90 threshold for this feature
+        # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], percentile=90.0, logger=logger
+            calibration_data, config["batch_size"], percentile=65.0, logger=logger
         )
 
         # Measure KLD from ablation
@@ -1045,12 +1067,14 @@ def main():
             calibration_data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature's top-10 tokens (only on active positions)
+        # Measure probability changes on TARGET feature's top-10 tokens (with dual filters)
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold, logger=logger
+            activation_threshold=feature_threshold,
+            prob_sum_threshold=0.05,
+            logger=logger
         )
 
         # Analyze per-feature tokens
@@ -1084,12 +1108,14 @@ def main():
             })
 
         # Measure probability changes on RANDOM feature (control)
-        # Use the SAME feature-specific tokens and SAME active positions for fair comparison
+        # Use the SAME feature-specific tokens and SAME filters for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold, logger=logger
+            activation_threshold=feature_threshold,
+            prob_sum_threshold=0.05,
+            logger=logger
         )
 
         # Prefix control stats
@@ -1122,10 +1148,10 @@ def main():
             model, saes[layer], feature_id, top_k=10, logger=logger
         )
 
-        # Calibrate P90 threshold for this feature
+        # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], percentile=90.0, logger=logger
+            calibration_data, config["batch_size"], percentile=65.0, logger=logger
         )
 
         # Measure KLD from ablation
@@ -1134,12 +1160,14 @@ def main():
             calibration_data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature's top-10 tokens (only on active positions)
+        # Measure probability changes on TARGET feature's top-10 tokens (with dual filters)
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold, logger=logger
+            activation_threshold=feature_threshold,
+            prob_sum_threshold=0.05,
+            logger=logger
         )
 
         # Analyze per-feature tokens
@@ -1177,12 +1205,14 @@ def main():
             })
 
         # Measure probability changes on RANDOM feature (control)
-        # Use the SAME feature-specific tokens and SAME active positions for fair comparison
+        # Use the SAME feature-specific tokens and SAME filters for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
             test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold, logger=logger
+            activation_threshold=feature_threshold,
+            prob_sum_threshold=0.05,
+            logger=logger
         )
 
         # Prefix control stats
