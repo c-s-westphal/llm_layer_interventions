@@ -404,6 +404,129 @@ def measure_probability_changes(
     return stats
 
 
+def analyze_per_feature_tokens(
+    model,
+    sae,
+    layer: int,
+    feature_id: int,
+    hook: str,
+    data: List[torch.Tensor],
+    batch_size: int,
+    tokenizer,
+    top_k: int = 20,
+    logger: logging.Logger = None
+) -> Dict[str, List]:
+    """Find top-K promoted and suppressed tokens for a specific feature.
+
+    Args:
+        model: HookedTransformer model
+        sae: SAE instance
+        layer: Layer index
+        feature_id: Feature ID
+        hook: Hook type
+        data: List of token tensors
+        batch_size: Batch size
+        tokenizer: Tokenizer for decoding
+        top_k: Number of top promoted/suppressed tokens to return
+        logger: Logger instance
+
+    Returns:
+        Dictionary with promoted and suppressed token info
+    """
+    logger = logger or logging.getLogger("ablation_intervention")
+    logger.info(f"  Finding top-{top_k} promoted/suppressed tokens for feature {feature_id}...")
+
+    hook_name = f"blocks.{layer}.hook_{hook}"
+    vocab_size = model.cfg.d_vocab
+
+    # Accumulate probability changes per token across all positions
+    token_changes_sum = torch.zeros(vocab_size, device=model.cfg.device)
+    token_changes_count = torch.zeros(vocab_size, device=model.cfg.device)
+
+    num_batches = (len(data) + batch_size - 1) // batch_size
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(data))
+        batch_tokens = data[batch_start:batch_end]
+        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+
+        # Baseline: SAE reconstruction without ablation
+        reconstruction_hook = create_reconstruction_hook(sae)
+
+        with torch.no_grad():
+            baseline_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, reconstruction_hook)]
+            )
+            baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+
+        # Ablated: SAE reconstruction WITH feature ablated
+        ablation_hook = create_ablation_hook(sae, feature_id)
+
+        with torch.no_grad():
+            ablated_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, ablation_hook)]
+            )
+            ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
+
+        # Compute relative change: (baseline - ablated) / baseline for ALL tokens
+        # Shape: [batch, seq, vocab]
+        mask = batch_dict["attention_mask"][:, 1:].unsqueeze(-1).bool()  # [batch, seq, 1]
+        relative_change = (baseline_probs - ablated_probs) / (baseline_probs + 1e-10)
+
+        # Mask out padding positions
+        relative_change = relative_change * mask
+
+        # Sum changes per token across batch and sequence
+        token_changes_sum += relative_change.sum(dim=(0, 1))
+        token_changes_count += mask.squeeze(-1).sum(dim=(0, 1)).unsqueeze(-1).expand(-1, vocab_size).sum(dim=0)
+
+    # Average change per token
+    avg_token_changes = token_changes_sum / (token_changes_count + 1e-10)
+
+    # Find top-K promoted tokens (most positive change)
+    top_promoted_values, top_promoted_indices = torch.topk(avg_token_changes, k=min(top_k, vocab_size))
+
+    # Find top-K suppressed tokens (most negative change)
+    top_suppressed_values, top_suppressed_indices = torch.topk(-avg_token_changes, k=min(top_k, vocab_size))
+    top_suppressed_values = -top_suppressed_values  # Convert back to negative
+
+    # Convert to lists and decode tokens
+    promoted_tokens = []
+    for idx, value in zip(top_promoted_indices.cpu().numpy(), top_promoted_values.cpu().numpy()):
+        token_str = tokenizer.decode([int(idx)])
+        promoted_tokens.append({
+            "token_id": int(idx),
+            "token_str": token_str,
+            "avg_change": float(value)
+        })
+
+    suppressed_tokens = []
+    for idx, value in zip(top_suppressed_indices.cpu().numpy(), top_suppressed_values.cpu().numpy()):
+        token_str = tokenizer.decode([int(idx)])
+        suppressed_tokens.append({
+            "token_id": int(idx),
+            "token_str": token_str,
+            "avg_change": float(value)
+        })
+
+    # Log results
+    logger.info(f"  Top-{min(5, top_k)} PROMOTED tokens (feature {feature_id}):")
+    for i, token_info in enumerate(promoted_tokens[:5]):
+        logger.info(f"    {i+1}. '{token_info['token_str']}' (ID {token_info['token_id']}): {token_info['avg_change']:.4f}")
+
+    logger.info(f"  Top-{min(5, top_k)} SUPPRESSED tokens (feature {feature_id}):")
+    for i, token_info in enumerate(suppressed_tokens[:5]):
+        logger.info(f"    {i+1}. '{token_info['token_str']}' (ID {token_info['token_id']}): {token_info['avg_change']:.4f}")
+
+    return {
+        "promoted_tokens": promoted_tokens,
+        "suppressed_tokens": suppressed_tokens
+    }
+
+
 def measure_probability_changes_random_control(
     model,
     sae,
@@ -672,6 +795,7 @@ def main():
 
     # Process features
     results = []
+    per_feature_token_results = []
 
     logger.info("\n" + "="*80)
     logger.info("PROCESSING FEATURES BY ACTIVATION")
@@ -692,6 +816,36 @@ def main():
             test_data, top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
+
+        # Analyze per-feature tokens
+        per_feature_analysis = analyze_per_feature_tokens(
+            model, saes[layer], layer, feature_id, config["hook"],
+            test_data, config["batch_size"], model.tokenizer,
+            top_k=20, logger=logger
+        )
+
+        # Store per-feature token results
+        for token_info in per_feature_analysis["promoted_tokens"]:
+            per_feature_token_results.append({
+                "layer": layer,
+                "feature_id": feature_id,
+                "selection_method": "activation",
+                "direction": "promoted",
+                "token_id": token_info["token_id"],
+                "token_str": token_info["token_str"],
+                "avg_change": token_info["avg_change"]
+            })
+
+        for token_info in per_feature_analysis["suppressed_tokens"]:
+            per_feature_token_results.append({
+                "layer": layer,
+                "feature_id": feature_id,
+                "selection_method": "activation",
+                "direction": "suppressed",
+                "token_id": token_info["token_id"],
+                "token_str": token_info["token_str"],
+                "avg_change": token_info["avg_change"]
+            })
 
         # Measure probability changes on RANDOM feature (control)
         control_stats = measure_probability_changes_random_control(
@@ -738,6 +892,40 @@ def main():
             config["batch_size"], model.tokenizer, logger
         )
 
+        # Analyze per-feature tokens
+        per_feature_analysis = analyze_per_feature_tokens(
+            model, saes[layer], layer, feature_id, config["hook"],
+            test_data, config["batch_size"], model.tokenizer,
+            top_k=20, logger=logger
+        )
+
+        # Store per-feature token results with label
+        for token_info in per_feature_analysis["promoted_tokens"]:
+            per_feature_token_results.append({
+                "layer": layer,
+                "feature_id": feature_id,
+                "selection_method": "interpretability",
+                "label": label,
+                "label_confidence": conf,
+                "direction": "promoted",
+                "token_id": token_info["token_id"],
+                "token_str": token_info["token_str"],
+                "avg_change": token_info["avg_change"]
+            })
+
+        for token_info in per_feature_analysis["suppressed_tokens"]:
+            per_feature_token_results.append({
+                "layer": layer,
+                "feature_id": feature_id,
+                "selection_method": "interpretability",
+                "label": label,
+                "label_confidence": conf,
+                "direction": "suppressed",
+                "token_id": token_info["token_id"],
+                "token_str": token_info["token_str"],
+                "avg_change": token_info["avg_change"]
+            })
+
         # Measure probability changes on RANDOM feature (control)
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
@@ -764,6 +952,12 @@ def main():
     results_path = output_dir / "ablation_intervention_results.csv"
     results_df.to_csv(results_path, index=False)
     logger.info(f"\nResults saved to: {results_path}")
+
+    # Save per-feature token results
+    per_feature_tokens_df = pd.DataFrame(per_feature_token_results)
+    per_feature_tokens_path = output_dir / "per_feature_tokens.csv"
+    per_feature_tokens_df.to_csv(per_feature_tokens_path, index=False)
+    logger.info(f"Per-feature token analysis saved to: {per_feature_tokens_path}")
 
     # Summary
     logger.info("\n" + "="*80)
