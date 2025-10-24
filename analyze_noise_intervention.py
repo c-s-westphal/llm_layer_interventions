@@ -1130,9 +1130,9 @@ def main():
         sae = saes[layer]
         hook_name = f"blocks.{layer}.hook_{config['hook']}"
 
-        # Compute P65 threshold for each feature
-        feature_thresholds = {}
-        all_layer_activations = []
+        # Collect flattened activations per feature to handle variable sequence lengths
+        feature_activations_list = [[] for _ in range(sae.cfg.d_sae)]  # One list per feature
+        total_positions = 0
 
         num_batches = (len(calibration_data) + config["batch_size"] - 1) // config["batch_size"]
         for batch_idx in range(num_batches):
@@ -1148,23 +1148,27 @@ def main():
                 )
                 acts = cache[hook_name]
                 sae_acts = sae.encode(acts)  # [batch, seq, d_sae]
-                all_layer_activations.append(sae_acts.cpu())
 
-        # Concatenate and compute thresholds + firing rates
-        all_layer_activations = torch.cat(all_layer_activations, dim=0)  # [total_batch, seq, d_sae]
-        total_positions = all_layer_activations.shape[0] * all_layer_activations.shape[1]
+                # Flatten batch and sequence dimensions
+                # [batch, seq, d_sae] -> [batch*seq, d_sae]
+                flat_acts = sae_acts.reshape(-1, sae_acts.shape[-1]).cpu()
+                total_positions += flat_acts.shape[0]
 
-        for feature_id in range(all_layer_activations.shape[2]):
-            feature_acts = all_layer_activations[:, :, feature_id].flatten()
+                # Append to per-feature lists
+                for feature_id in range(sae_acts.shape[-1]):
+                    feature_activations_list[feature_id].append(flat_acts[:, feature_id])
+
+        # Compute thresholds + firing rates for each feature
+        for feature_id in range(sae.cfg.d_sae):
+            # Concatenate all activations for this feature
+            feature_acts = torch.cat(feature_activations_list[feature_id], dim=0)
             non_zero_acts = feature_acts[feature_acts > 0]
 
             if len(non_zero_acts) > 0:
                 threshold = float(np.percentile(non_zero_acts.numpy(), 65.0))
                 firing_rate = (feature_acts > threshold).sum().item() / total_positions
-                feature_thresholds[(layer, feature_id)] = threshold
                 feature_firing_rates[(layer, feature_id)] = firing_rate
             else:
-                feature_thresholds[(layer, feature_id)] = 0.0
                 feature_firing_rates[(layer, feature_id)] = 0.0
 
     # Select top K features by COMPOSITE SCORE (interpretability + firing rate) PER LAYER
