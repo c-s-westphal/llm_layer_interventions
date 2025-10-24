@@ -1,7 +1,12 @@
 """Analyze SAE feature interventions using ablation.
 
-This script ablates (zeros out) features in SAE latent space, measures the KLD,
-and analyzes probability changes on important tokens.
+This script:
+1. Uses logit lens to find each feature's canonical top-10 tokens
+2. Ablates (zeros out) features in SAE latent space
+3. Measures how ablation affects those feature-specific tokens
+4. Compares against random feature controls
+
+This validates whether interpretable features promote their labeled tokens.
 """
 
 import os
@@ -188,6 +193,54 @@ def compute_kl_divergence(
     return kl_mean.item()
 
 
+def get_feature_top_tokens_logit_lens(
+    model,
+    sae,
+    feature_id: int,
+    top_k: int = 10,
+    logger: logging.Logger = None
+) -> List[int]:
+    """Find top-K tokens for a feature using logit lens (direct logit attribution).
+
+    Args:
+        model: HookedTransformer model
+        sae: SAE instance
+        feature_id: Feature ID
+        top_k: Number of top tokens to return
+        logger: Logger instance
+
+    Returns:
+        List of token IDs
+    """
+    logger = logger or logging.getLogger("ablation_intervention")
+
+    # Create one-hot vector for this feature in SAE latent space
+    d_sae = sae.cfg.d_sae
+    feature_vector = torch.zeros(d_sae, device=sae.device)
+    feature_vector[feature_id] = 1.0
+
+    # Decode through SAE to get activation delta
+    with torch.no_grad():
+        activation_delta = sae.decode(feature_vector.unsqueeze(0))  # [1, d_model]
+
+        # Project through model's unembedding to get logit contributions
+        # model.unembed is typically W_U with shape [d_model, d_vocab]
+        logits = model.unembed(activation_delta)  # [1, d_vocab]
+        logits = logits.squeeze(0)  # [d_vocab]
+
+    # Get top-K tokens
+    top_values, top_indices = torch.topk(logits, k=min(top_k, model.cfg.d_vocab))
+    top_tokens = top_indices.cpu().tolist()
+
+    # Log the tokens
+    logger.info(f"  Top-{top_k} tokens via logit lens for feature {feature_id}:")
+    for i, (token_id, value) in enumerate(zip(top_tokens[:min(10, top_k)], top_values.cpu().tolist()[:min(10, top_k)])):
+        token_str = model.tokenizer.decode([token_id])
+        logger.info(f"    {i+1}. '{token_str}' (ID {token_id}): logit={value:.4f}")
+
+    return top_tokens
+
+
 def create_ablation_hook(sae, feature_id: int):
     """Create a hook that ablates (zeros out) a specific feature.
 
@@ -310,7 +363,7 @@ def measure_probability_changes(
     tokenizer,
     logger: logging.Logger = None
 ) -> Dict[str, float]:
-    """Measure probability changes on top tokens when ablating a feature.
+    """Measure probability changes on feature-specific top tokens when ablating a feature.
 
     Args:
         model: HookedTransformer model
@@ -319,7 +372,7 @@ def measure_probability_changes(
         feature_id: Feature ID
         hook: Hook type
         data: List of token tensors
-        top_tokens: List of important token IDs
+        top_tokens: List of feature-specific token IDs (from logit lens)
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         logger: Logger instance
@@ -328,13 +381,7 @@ def measure_probability_changes(
         Dictionary with statistics (mean, median, etc.)
     """
     logger = logger or logging.getLogger("ablation_intervention")
-    logger.info(f"  Measuring probability changes on TARGET feature {feature_id} (ablation)...")
-
-    # Log which tokens we're analyzing
-    logger.info(f"  Analyzing probability changes for tokens:")
-    for i, token_id in enumerate(top_tokens[:10]):
-        token_str = tokenizer.decode([token_id])
-        logger.info(f"    {i+1}. Token {token_id} ('{token_str}')")
+    logger.info(f"  Measuring probability changes on feature {feature_id}'s top-{len(top_tokens)} tokens...")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
@@ -395,7 +442,7 @@ def measure_probability_changes(
         "q75": float(np.percentile(all_changes, 75))
     }
 
-    logger.info(f"  Top-10 token probability change statistics (target feature):")
+    logger.info(f"  Feature {feature_id}'s top-{len(top_tokens)} token probability change statistics:")
     logger.info(f"    Mean: {stats['mean']:.4f}")
     logger.info(f"    Median: {stats['median']:.4f}")
     logger.info(f"    Std: {stats['std']:.4f}")
@@ -548,7 +595,7 @@ def measure_probability_changes_random_control(
         feature_id: Original feature ID (will select a different random one)
         hook: Hook type
         data: List of token tensors
-        top_tokens: Same top-10 tokens as target measurement
+        top_tokens: Same feature-specific tokens as target measurement
         batch_size: Batch size
         tokenizer: Tokenizer for logging
         logger: Logger instance
@@ -564,7 +611,7 @@ def measure_probability_changes_random_control(
     while random_feature_id == feature_id:
         random_feature_id = np.random.randint(0, d_sae)
 
-    logger.info(f"  Measuring probability changes on RANDOM feature {random_feature_id} vs TARGET feature {feature_id} (control)...")
+    logger.info(f"  Control: Measuring effects of RANDOM feature {random_feature_id} on feature {feature_id}'s top-{len(top_tokens)} tokens...")
 
     hook_name = f"blocks.{layer}.hook_{hook}"
     top_tokens_tensor = torch.tensor(top_tokens, device=model.cfg.device)
@@ -625,7 +672,7 @@ def measure_probability_changes_random_control(
         "q75": float(np.percentile(all_changes, 75))
     }
 
-    logger.info(f"  Top-10 token probability change statistics (random feature {random_feature_id} control):")
+    logger.info(f"  Control (random feature {random_feature_id}) on same tokens:")
     logger.info(f"    Mean: {stats['mean']:.4f}")
     logger.info(f"    Median: {stats['median']:.4f}")
 
@@ -704,16 +751,6 @@ def main():
     )
     test_data, _ = test_loader.load_and_tokenize()
     logger.info(f"Loaded {len(test_data)} test passages")
-
-    # Find top-10 tokens by probability
-    top_tokens = find_top_tokens_by_probability(
-        model,
-        calibration_data,
-        batch_size=config["batch_size"],
-        top_k=10,
-        sample_size=50,
-        logger=logger
-    )
 
     # Load interpretability scores from CSV
     logger.info("Loading interpretability scores from neuronpedia_features.csv...")
@@ -804,16 +841,21 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
+        # Get feature-specific top-10 tokens via logit lens
+        feature_top_tokens = get_feature_top_tokens_logit_lens(
+            model, saes[layer], feature_id, top_k=10, logger=logger
+        )
+
         # Measure KLD from ablation
         ablation_kld = measure_kld_with_ablation(
             model, saes[layer], layer, feature_id, config["hook"],
             calibration_data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature
+        # Measure probability changes on TARGET feature's top-10 tokens
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens,
+            test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -848,9 +890,10 @@ def main():
             })
 
         # Measure probability changes on RANDOM feature (control)
+        # Use the SAME feature-specific tokens for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens,
+            test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -879,16 +922,21 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
+        # Get feature-specific top-10 tokens via logit lens
+        feature_top_tokens = get_feature_top_tokens_logit_lens(
+            model, saes[layer], feature_id, top_k=10, logger=logger
+        )
+
         # Measure KLD from ablation
         ablation_kld = measure_kld_with_ablation(
             model, saes[layer], layer, feature_id, config["hook"],
             calibration_data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature
+        # Measure probability changes on TARGET feature's top-10 tokens
         stats = measure_probability_changes(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens,
+            test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
@@ -927,9 +975,10 @@ def main():
             })
 
         # Measure probability changes on RANDOM feature (control)
+        # Use the SAME feature-specific tokens for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, top_tokens,
+            test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer, logger
         )
 
