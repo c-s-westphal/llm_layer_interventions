@@ -263,50 +263,118 @@ def calibrate_feature_threshold(
     return threshold
 
 
-def get_feature_top_tokens_logit_lens(
+def discover_feature_tokens_empirical(
     model,
     sae,
+    layer: int,
     feature_id: int,
-    top_k: int = 10,
+    hook: str,
+    data: List[torch.Tensor],
+    batch_size: int,
+    threshold_percentile: float = 80.0,
+    top_k: int = 15,
     logger: logging.Logger = None
 ) -> List[int]:
-    """Find top-K tokens for a feature using logit lens (direct logit attribution).
+    """Discover top-K tokens for a feature empirically by observing what tokens actually appear.
+
+    Finds positions where the feature activates highly (>threshold_percentile), then looks at
+    which tokens actually appear NEXT at those positions, returning the most frequent ones.
 
     Args:
         model: HookedTransformer model
         sae: SAE instance
+        layer: Layer index
         feature_id: Feature ID
-        top_k: Number of top tokens to return
+        hook: Hook type
+        data: List of token tensors for discovery
+        batch_size: Batch size
+        threshold_percentile: Percentile threshold for high activation (default 80)
+        top_k: Number of top tokens to return (default 15)
         logger: Logger instance
 
     Returns:
-        List of token IDs
+        List of token IDs (most frequent tokens following high feature activation)
     """
     logger = logger or logging.getLogger("ablation_intervention")
+    logger.info(f"  Discovering top-{top_k} tokens empirically for feature {feature_id} (P{threshold_percentile} threshold)...")
 
-    # Create one-hot vector for this feature in SAE latent space
-    d_sae = sae.cfg.d_sae
-    feature_vector = torch.zeros(d_sae, device=sae.device)
-    feature_vector[feature_id] = 1.0
+    hook_name = f"blocks.{layer}.hook_{hook}"
 
-    # Decode through SAE to get activation delta
-    with torch.no_grad():
-        activation_delta = sae.decode(feature_vector.unsqueeze(0))  # [1, d_model]
+    # Step 1: Collect all activations to compute threshold
+    all_activations = []
+    all_next_tokens = []
 
-        # Project through model's unembedding to get logit contributions
-        # model.unembed is typically W_U with shape [d_model, d_vocab]
-        logits = model.unembed(activation_delta)  # [1, d_vocab]
-        logits = logits.squeeze(0)  # [d_vocab]
+    num_batches = (len(data) + batch_size - 1) // batch_size
 
-    # Get top-K tokens
-    top_values, top_indices = torch.topk(logits, k=min(top_k, model.cfg.d_vocab))
-    top_tokens = top_indices.cpu().tolist()
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(data))
+        batch_tokens = data[batch_start:batch_end]
+        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
-    # Log the tokens
-    logger.info(f"  Top-{top_k} tokens via logit lens for feature {feature_id}:")
-    for i, (token_id, value) in enumerate(zip(top_tokens[:min(10, top_k)], top_values.cpu().tolist()[:min(10, top_k)])):
+        with torch.no_grad():
+            _, cache = model.run_with_cache(
+                batch_dict["input_ids"],
+                names_filter=[hook_name]
+            )
+            acts = cache[hook_name]
+            sae_acts = sae.encode(acts)
+            feature_acts = sae_acts[:, :, feature_id]  # [batch, seq]
+
+            # Get attention mask (exclude padding)
+            attention_mask = batch_dict["attention_mask"][:, 1:].bool()  # [batch, seq-1]
+
+            # For positions with valid next tokens (exclude last position)
+            valid_positions_mask = attention_mask[:, :-1]  # [batch, seq-2]
+
+            # Get feature activations at valid positions
+            feature_acts_valid = feature_acts[:, :-2][valid_positions_mask]
+
+            # Get the NEXT tokens at those positions
+            next_tokens = batch_dict["input_ids"][:, 2:][valid_positions_mask]  # shift by 2 to get next token
+
+            all_activations.append(feature_acts_valid.cpu())
+            all_next_tokens.append(next_tokens.cpu())
+
+    # Concatenate all activations and tokens
+    all_activations = torch.cat(all_activations)
+    all_next_tokens = torch.cat(all_next_tokens)
+
+    # Step 2: Find threshold (e.g., P80 of non-zero activations)
+    non_zero_activations = all_activations[all_activations > 0]
+
+    if len(non_zero_activations) == 0:
+        logger.warning(f"  Feature {feature_id} has no non-zero activations! Returning empty list.")
+        return []
+
+    threshold = np.percentile(non_zero_activations.numpy(), threshold_percentile)
+    logger.info(f"  P{threshold_percentile} threshold: {threshold:.4f} ({len(non_zero_activations)} non-zero activations)")
+
+    # Step 3: Get tokens that appear after high activations
+    high_activation_mask = all_activations > threshold
+    high_activation_next_tokens = all_next_tokens[high_activation_mask]
+
+    if len(high_activation_next_tokens) == 0:
+        logger.warning(f"  No positions above P{threshold_percentile} threshold! Returning empty list.")
+        return []
+
+    logger.info(f"  Found {len(high_activation_next_tokens)} positions with activation > {threshold:.4f}")
+
+    # Step 4: Count token frequencies
+    token_counts = {}
+    for token_id in high_activation_next_tokens.tolist():
+        token_counts[token_id] = token_counts.get(token_id, 0) + 1
+
+    # Step 5: Sort by frequency and get top-K
+    sorted_tokens = sorted(token_counts.items(), key=lambda x: x[1], reverse=True)
+    top_tokens = [token_id for token_id, count in sorted_tokens[:top_k]]
+
+    # Log the discovered tokens
+    logger.info(f"  Top-{min(top_k, len(top_tokens))} empirically discovered tokens for feature {feature_id}:")
+    for i, (token_id, count) in enumerate(sorted_tokens[:min(10, top_k)]):
         token_str = model.tokenizer.decode([token_id])
-        logger.info(f"    {i+1}. '{token_str}' (ID {token_id}): logit={value:.4f}")
+        freq = count / len(high_activation_next_tokens)
+        logger.info(f"    {i+1}. '{token_str}' (ID {token_id}): count={count}, freq={freq:.4f}")
 
     return top_tokens
 
@@ -1050,10 +1118,17 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Get feature-specific top-10 tokens via logit lens
-        feature_top_tokens = get_feature_top_tokens_logit_lens(
-            model, saes[layer], feature_id, top_k=10, logger=logger
+        # Discover feature-specific top tokens empirically
+        feature_top_tokens = discover_feature_tokens_empirical(
+            model, saes[layer], layer, feature_id, config["hook"],
+            calibration_data, config["batch_size"],
+            threshold_percentile=80.0, top_k=15, logger=logger
         )
+
+        # Skip this feature if no tokens were discovered
+        if len(feature_top_tokens) == 0:
+            logger.warning(f"  Skipping feature {feature_id} - no tokens discovered")
+            continue
 
         # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
@@ -1143,10 +1218,17 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Get feature-specific top-10 tokens via logit lens
-        feature_top_tokens = get_feature_top_tokens_logit_lens(
-            model, saes[layer], feature_id, top_k=10, logger=logger
+        # Discover feature-specific top tokens empirically
+        feature_top_tokens = discover_feature_tokens_empirical(
+            model, saes[layer], layer, feature_id, config["hook"],
+            calibration_data, config["batch_size"],
+            threshold_percentile=80.0, top_k=15, logger=logger
         )
+
+        # Skip this feature if no tokens were discovered
+        if len(feature_top_tokens) == 0:
+            logger.warning(f"  Skipping feature {feature_id} - no tokens discovered")
+            continue
 
         # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(

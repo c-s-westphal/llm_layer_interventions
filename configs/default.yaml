@@ -13,9 +13,10 @@ live_percentile: 90  # P90 threshold for determining "live" positions
 
 # Corpus configuration
 corpus_name: "wikitext2"  # Currently only wikitext2 supported
-max_passages: 200  # Number of passages to use
+max_passages: 200  # Number of passages to use (default for test if not specified)
+test_passages: 1500  # Passages for test measurements (increased for robust statistics)
 max_len: 256  # Maximum token length per passage
-calibration_passages: 50  # Passages for calibration pass
+calibration_passages: 200  # Passages for calibration (empirical token discovery + thresholds)
 
 # Feature selection
 feature_source: "csv"  # Options: "csv", "neuronpedia_api", "static"
