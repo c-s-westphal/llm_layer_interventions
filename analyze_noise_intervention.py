@@ -441,7 +441,7 @@ def analyze_per_feature_tokens(
 
     # Accumulate probability changes per token across all positions
     token_changes_sum = torch.zeros(vocab_size, device=model.cfg.device)
-    token_changes_count = torch.zeros(vocab_size, device=model.cfg.device)
+    num_valid_positions = 0
 
     num_batches = (len(data) + batch_size - 1) // batch_size
 
@@ -481,10 +481,10 @@ def analyze_per_feature_tokens(
 
         # Sum changes per token across batch and sequence
         token_changes_sum += relative_change.sum(dim=(0, 1))
-        token_changes_count += mask.squeeze(-1).sum(dim=(0, 1)).unsqueeze(-1).expand(-1, vocab_size).sum(dim=0)
+        num_valid_positions += mask.sum().item()
 
     # Average change per token
-    avg_token_changes = token_changes_sum / (token_changes_count + 1e-10)
+    avg_token_changes = token_changes_sum / (num_valid_positions + 1e-10)
 
     # Find top-K promoted tokens (most positive change)
     top_promoted_values, top_promoted_indices = torch.topk(avg_token_changes, k=min(top_k, vocab_size))
