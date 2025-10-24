@@ -631,6 +631,82 @@ def measure_probability_changes(
         logger.info(f"    Std: {stats['std']:.4f}")
         logger.info(f"    Range: [{stats['min']:.4f}, {stats['max']:.4f}]")
 
+        # Diagnostic logging for extreme changes
+        if abs(stats['mean']) > 1.0:  # Flag if relative change > 100%
+            logger.warning(f"")
+            logger.warning(f"  ⚠️  EXTREME PROBABILITY CHANGE DETECTED")
+            logger.warning(f"  Feature {feature_id}: mean relative change = {stats['mean']:.2f}")
+            logger.warning(f"  Active positions: {positions_active}, Total: {total_positions}")
+            logger.warning(f"")
+
+            # Sample a few positions to show actual probabilities
+            # Get first batch to show examples
+            sample_batch_dict = collate_batch(data[:batch_size], device=model.cfg.device)
+            with torch.no_grad():
+                _, cache = model.run_with_cache(
+                    sample_batch_dict["input_ids"],
+                    names_filter=[hook_name]
+                )
+                acts = cache[hook_name]
+                sae_acts = sae.encode(acts)
+                sample_feature_acts = sae_acts[:, :, feature_id]
+
+                reconstruction_hook = create_reconstruction_hook(sae)
+                sample_baseline_logits = model.run_with_hooks(
+                    sample_batch_dict["input_ids"],
+                    fwd_hooks=[(hook_name, reconstruction_hook)]
+                )
+                sample_baseline_probs = torch.softmax(sample_baseline_logits[:, :-1, :], dim=-1)
+
+                ablation_hook = create_ablation_hook(sae, feature_id)
+                sample_ablated_logits = model.run_with_hooks(
+                    sample_batch_dict["input_ids"],
+                    fwd_hooks=[(hook_name, ablation_hook)]
+                )
+                sample_ablated_probs = torch.softmax(sample_ablated_logits[:, :-1, :], dim=-1)
+
+            # Find positions where feature is active in sample
+            sample_active_mask = (sample_feature_acts[:, :-1] > activation_threshold) & sample_batch_dict["attention_mask"][:, 1:].bool()
+            if sample_active_mask.sum() > 0:
+                # Get first active position
+                active_indices = sample_active_mask.nonzero(as_tuple=False)
+                if len(active_indices) > 0:
+                    batch_idx, seq_idx = active_indices[0]
+
+                    logger.warning(f"  Example from position [{batch_idx}, {seq_idx}]:")
+                    logger.warning(f"    Feature activation: {sample_feature_acts[batch_idx, seq_idx]:.4f}")
+
+                    # Show probabilities for the top tokens
+                    logger.warning(f"    Top-{len(top_tokens)} token probabilities (baseline → ablated):")
+                    for i, token_id in enumerate(top_tokens[:5]):  # Show first 5
+                        baseline_p = sample_baseline_probs[batch_idx, seq_idx, token_id].item()
+                        ablated_p = sample_ablated_probs[batch_idx, seq_idx, token_id].item()
+                        abs_change = ablated_p - baseline_p
+                        rel_change = (baseline_p - ablated_p) / (baseline_p + 1e-10)
+
+                        token_str = tokenizer.decode([token_id])
+                        logger.warning(
+                            f"      '{token_str}' (ID {token_id}): "
+                            f"{baseline_p:.6f} → {ablated_p:.6f} "
+                            f"(Δ={abs_change:+.6f}, rel={rel_change:+.2f})"
+                        )
+
+            logger.warning(f"")
+            logger.warning(f"  Interpretation:")
+            if stats['mean'] < 0:
+                logger.warning(f"    → Feature PROMOTES these tokens (ablating decreased their probability)")
+                if positions_active < 100:
+                    logger.warning(f"    → Extreme value likely due to: SMALL SAMPLE SIZE ({positions_active} positions)")
+                else:
+                    logger.warning(f"    → Feature has VERY STRONG promoting effect on these tokens")
+            else:
+                logger.warning(f"    → Feature SUPPRESSES these tokens (ablating increased their probability)")
+                if positions_active < 100:
+                    logger.warning(f"    → Extreme value likely due to: SMALL SAMPLE SIZE ({positions_active} positions)")
+                else:
+                    logger.warning(f"    → Feature has VERY STRONG suppressing effect on these tokens")
+            logger.warning(f"")
+
     return stats
 
 
@@ -1046,9 +1122,55 @@ def main():
         for (l, feature_id), activation in top_k:
             logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
-    # Select top K features by interpretability PER LAYER (no activation filter)
+    # Compute firing rates for all features
+    logger.info("\nComputing firing rates (% of positions where feature activates above P65)...")
+    feature_firing_rates = {}  # (layer, feature_id) -> firing_rate
+
+    for layer in tqdm(config["layers"], desc="Computing firing rates"):
+        sae = saes[layer]
+        hook_name = f"blocks.{layer}.hook_{config['hook']}"
+
+        # Compute P65 threshold for each feature
+        feature_thresholds = {}
+        all_layer_activations = []
+
+        num_batches = (len(calibration_data) + config["batch_size"] - 1) // config["batch_size"]
+        for batch_idx in range(num_batches):
+            batch_start = batch_idx * config["batch_size"]
+            batch_end = min(batch_start + config["batch_size"], len(calibration_data))
+            batch_tokens = calibration_data[batch_start:batch_end]
+            batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+
+            with torch.no_grad():
+                _, cache = model.run_with_cache(
+                    batch_dict["input_ids"],
+                    names_filter=[hook_name]
+                )
+                acts = cache[hook_name]
+                sae_acts = sae.encode(acts)  # [batch, seq, d_sae]
+                all_layer_activations.append(sae_acts.cpu())
+
+        # Concatenate and compute thresholds + firing rates
+        all_layer_activations = torch.cat(all_layer_activations, dim=0)  # [total_batch, seq, d_sae]
+        total_positions = all_layer_activations.shape[0] * all_layer_activations.shape[1]
+
+        for feature_id in range(all_layer_activations.shape[2]):
+            feature_acts = all_layer_activations[:, :, feature_id].flatten()
+            non_zero_acts = feature_acts[feature_acts > 0]
+
+            if len(non_zero_acts) > 0:
+                threshold = float(np.percentile(non_zero_acts.numpy(), 65.0))
+                firing_rate = (feature_acts > threshold).sum().item() / total_positions
+                feature_thresholds[(layer, feature_id)] = threshold
+                feature_firing_rates[(layer, feature_id)] = firing_rate
+            else:
+                feature_thresholds[(layer, feature_id)] = 0.0
+                feature_firing_rates[(layer, feature_id)] = 0.0
+
+    # Select top K features by COMPOSITE SCORE (interpretability + firing rate) PER LAYER
     top_by_interpretability_list = []
-    logger.info(f"\nTop {args.top_k_interpretability} features by interpretability per layer (no activation filter):")
+    logger.info(f"\nTop {args.top_k_interpretability} features by COMPOSITE SCORE (interpretability × firing rate) per layer:")
+    logger.info(f"  Minimum thresholds: confidence >= 0.65, firing_rate >= 0.0005 (0.05%)")
     for layer in config["layers"]:
         # Get features for this layer from CSV
         layer_features = features_df[features_df["layer"] == layer].copy()
@@ -1057,7 +1179,7 @@ def main():
             logger.info(f"  Layer {layer}: No labeled features found")
             continue
 
-        # Add activation data for logging purposes
+        # Add activation and firing rate data
         layer_features["avg_activation"] = layer_features.apply(
             lambda row: feature_avg_activations.get((layer, int(row["feature_id"])), 0.0),
             axis=1
@@ -1066,9 +1188,32 @@ def main():
             lambda row: feature_max_activations.get((layer, int(row["feature_id"])), 0.0),
             axis=1
         )
+        layer_features["firing_rate"] = layer_features.apply(
+            lambda row: feature_firing_rates.get((layer, int(row["feature_id"])), 0.0),
+            axis=1
+        )
 
-        # Sort by confidence and take top K (no activation filtering)
-        top_k = layer_features.nlargest(min(args.top_k_interpretability, len(layer_features)), "label_confidence")
+        # Filter for minimum quality: confidence >= 0.65 AND firing_rate >= 0.0005 (0.05%)
+        valid_features = layer_features[
+            (layer_features["label_confidence"] >= 0.65) &
+            (layer_features["firing_rate"] >= 0.0005)
+        ].copy()
+
+        if len(valid_features) == 0:
+            logger.info(f"  Layer {layer}: No features meeting minimum thresholds")
+            continue
+
+        # Compute firing rate percentile within this layer
+        valid_features["firing_rate_pct"] = valid_features["firing_rate"].rank(pct=True)
+
+        # Composite score: confidence * sqrt(firing_rate_percentile)
+        valid_features["composite_score"] = (
+            valid_features["label_confidence"] *
+            np.sqrt(valid_features["firing_rate_pct"])
+        )
+
+        # Select top K by composite score
+        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "composite_score")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
@@ -1077,11 +1222,12 @@ def main():
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
-                    f"conf={row['label_confidence']:.2f}, label='{row['label']}', "
-                    f"avg_act={row['avg_activation']:.4f}, max_act={row['max_activation']:.2f}"
+                    f"score={row['composite_score']:.3f} "
+                    f"(conf={row['label_confidence']:.2f}, fire={row['firing_rate']:.4f}={row['firing_rate']*100:.2f}%), "
+                    f"label='{row['label']}'"
                 )
         else:
-            logger.info(f"  Layer {layer}: No labeled features found")
+            logger.info(f"  Layer {layer}: No features meeting minimum thresholds")
 
     # Concatenate all layers
     if top_by_interpretability_list:
