@@ -489,6 +489,197 @@ def measure_kld_with_ablation(
     return kld
 
 
+def discover_and_measure_promoted_tokens(
+    model,
+    sae,
+    layer: int,
+    feature_id: int,
+    hook: str,
+    data: List[torch.Tensor],
+    batch_size: int,
+    tokenizer,
+    activation_threshold: float,
+    top_k: int = 15,
+    min_effect: float = 0.0001,
+    logger: logging.Logger = None
+) -> Dict:
+    """Unified: Discover top-K promoted tokens AND measure their effects in single pass.
+
+    Efficiently combines causal discovery with measurement by processing data once:
+    1. For each position where feature activates > threshold:
+       - Compute baseline probs (with feature)
+       - Compute ablated probs (without feature)
+       - Track change for every token
+    2. Find tokens with positive effect > min_effect
+    3. Select top-K by effect size
+    4. Return both the tokens and their measurement statistics
+
+    Args:
+        model: HookedTransformer model
+        sae: SAE instance
+        layer: Layer index
+        feature_id: Feature ID
+        hook: Hook type
+        data: List of token tensors
+        batch_size: Batch size
+        tokenizer: Tokenizer for logging
+        activation_threshold: Only measure where feature > threshold
+        top_k: Number of top promoted tokens to return
+        min_effect: Minimum effect size to consider (default 0.0001)
+        logger: Logger instance
+
+    Returns:
+        Dictionary with:
+            - 'promoted_tokens': List of top-K promoted token IDs
+            - 'measurement_stats': Statistics on those tokens
+            - 'token_effects': Dict of all token effects (for analysis)
+    """
+    logger = logger or logging.getLogger("ablation_intervention")
+    logger.info(f"  Discovering promoted tokens causally (threshold: effect > {min_effect})...")
+
+    hook_name = f"blocks.{layer}.hook_{hook}"
+    vocab_size = model.cfg.d_vocab
+
+    # Accumulate effects across all tokens
+    token_effect_sum = torch.zeros(vocab_size, dtype=torch.float32, device='cpu')
+    token_effect_count = 0
+    all_position_effects = []  # Store per-position effects for top-K tokens later
+
+    num_batches = (len(data) + batch_size - 1) // batch_size
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(data))
+        batch_tokens = data[batch_start:batch_end]
+        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+
+        # Get feature activations
+        with torch.no_grad():
+            _, cache = model.run_with_cache(
+                batch_dict["input_ids"],
+                names_filter=[hook_name]
+            )
+            acts = cache[hook_name]
+            sae_acts = sae.encode(acts)
+            feature_acts = sae_acts[:, :, feature_id]  # [batch, seq]
+
+        # Baseline: with feature
+        reconstruction_hook = create_reconstruction_hook(sae)
+        with torch.no_grad():
+            baseline_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, reconstruction_hook)]
+            )
+            baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
+
+        # Ablated: without feature
+        ablation_hook = create_ablation_hook(sae, feature_id)
+        with torch.no_grad():
+            ablated_logits = model.run_with_hooks(
+                batch_dict["input_ids"],
+                fwd_hooks=[(hook_name, ablation_hook)]
+            )
+            ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
+
+        # Create mask for active positions
+        attention_mask = batch_dict["attention_mask"][:, 1:].bool()
+        active_mask = feature_acts[:, :-1] > activation_threshold
+        combined_mask = attention_mask & active_mask
+
+        if combined_mask.sum() == 0:
+            continue
+
+        # Compute change for all tokens at active positions
+        # Shape: [n_active_positions, vocab_size]
+        change = baseline_probs[combined_mask] - ablated_probs[combined_mask]
+
+        # Accumulate
+        token_effect_sum += change.sum(dim=0).cpu()
+        token_effect_count += combined_mask.sum().item()
+        all_position_effects.append(change.cpu())
+
+    if token_effect_count == 0:
+        logger.warning(f"  No active positions found for feature {feature_id}")
+        return {
+            'promoted_tokens': [],
+            'measurement_stats': {
+                'mean': 0.0,
+                'median': 0.0,
+                'std': 0.0,
+                'min': 0.0,
+                'max': 0.0,
+                'num_active_positions': 0
+            },
+            'token_effects': {}
+        }
+
+    # Compute mean effect per token
+    mean_effects = token_effect_sum / token_effect_count
+
+    # Filter for promoted tokens (positive effect > min_effect)
+    promoted_mask = mean_effects > min_effect
+    promoted_token_ids = torch.where(promoted_mask)[0]
+    promoted_effects = mean_effects[promoted_mask]
+
+    if len(promoted_token_ids) == 0:
+        logger.warning(f"  No promoted tokens found (all effects < {min_effect})")
+        return {
+            'promoted_tokens': [],
+            'measurement_stats': {
+                'mean': 0.0,
+                'median': 0.0,
+                'std': 0.0,
+                'min': 0.0,
+                'max': 0.0,
+                'num_active_positions': token_effect_count
+            },
+            'token_effects': {}
+        }
+
+    # Select top-K by effect size
+    k = min(top_k, len(promoted_effects))
+    top_k_indices = promoted_effects.topk(k).indices
+    top_k_token_ids = promoted_token_ids[top_k_indices].tolist()
+    top_k_effects = promoted_effects[top_k_indices]
+
+    logger.info(f"  Found {len(promoted_token_ids)} promoted tokens from {token_effect_count} active positions")
+    logger.info(f"  Top-{k} PROMOTED tokens (causal discovery):")
+    for i, (token_id, effect) in enumerate(zip(top_k_token_ids[:5], top_k_effects[:5])):
+        token_str = tokenizer.decode([token_id])
+        logger.info(f"    {i+1}. '{token_str}' (ID {token_id}): effect={effect:.4f}")
+
+    # Compute detailed statistics on top-K tokens
+    # Concatenate all position effects
+    all_effects_tensor = torch.cat(all_position_effects, dim=0)  # [total_active_positions, vocab_size]
+
+    # Extract effects for top-K tokens
+    top_k_position_effects = all_effects_tensor[:, top_k_token_ids].mean(dim=1)  # Mean across top-K tokens per position
+
+    stats = {
+        'mean': float(top_k_position_effects.mean()),
+        'median': float(top_k_position_effects.median()),
+        'std': float(top_k_position_effects.std()),
+        'min': float(top_k_position_effects.min()),
+        'max': float(top_k_position_effects.max()),
+        'num_active_positions': token_effect_count
+    }
+
+    logger.info(f"  Measurement statistics on {k} promoted tokens:")
+    logger.info(f"    Mean: {stats['mean']:.4f} (POSITIVE = feature promotes these)")
+    logger.info(f"    Median: {stats['median']:.4f}")
+    logger.info(f"    Std: {stats['std']:.4f}")
+    logger.info(f"    Range: [{stats['min']:.4f}, {stats['max']:.4f}]")
+
+    # Return all token effects for deeper analysis
+    token_effects = {int(i): float(eff) for i, eff in enumerate(mean_effects) if eff > 0}
+
+    return {
+        'promoted_tokens': top_k_token_ids,
+        'measurement_stats': stats,
+        'token_effects': token_effects
+    }
+
+
 def measure_probability_changes(
     model,
     sae,
@@ -1122,16 +1313,27 @@ def main():
         for (l, feature_id), activation in top_k:
             logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
-    # Compute firing rates for all features
-    logger.info("\nComputing firing rates (% of positions where feature activates above P65)...")
+    # Compute firing rates ONLY for labeled features (not all 270k!)
+    logger.info("\nComputing firing rates for labeled features only (% of positions where feature activates above P65)...")
     feature_firing_rates = {}  # (layer, feature_id) -> firing_rate
 
+    # Get all unique (layer, feature_id) pairs from CSV
+    labeled_features = features_df[['layer', 'feature_id']].drop_duplicates()
+    logger.info(f"  Computing firing rates for {len(labeled_features)} labeled features")
+
     for layer in tqdm(config["layers"], desc="Computing firing rates"):
+        # Only process features that have labels in this layer
+        layer_labeled = labeled_features[labeled_features['layer'] == layer]
+
+        if len(layer_labeled) == 0:
+            continue
+
         sae = saes[layer]
         hook_name = f"blocks.{layer}.hook_{config['hook']}"
 
-        # Collect flattened activations per feature to handle variable sequence lengths
-        feature_activations_list = [[] for _ in range(sae.cfg.d_sae)]  # One list per feature
+        # Collect activations for ONLY labeled features in this layer
+        labeled_feature_ids = layer_labeled['feature_id'].tolist()
+        feature_activations = {fid: [] for fid in labeled_feature_ids}
         total_positions = 0
 
         num_batches = (len(calibration_data) + config["batch_size"] - 1) // config["batch_size"]
@@ -1150,18 +1352,20 @@ def main():
                 sae_acts = sae.encode(acts)  # [batch, seq, d_sae]
 
                 # Flatten batch and sequence dimensions
-                # [batch, seq, d_sae] -> [batch*seq, d_sae]
                 flat_acts = sae_acts.reshape(-1, sae_acts.shape[-1]).cpu()
-                total_positions += flat_acts.shape[0]
+                if batch_idx == 0:
+                    total_positions = flat_acts.shape[0]
+                else:
+                    total_positions += flat_acts.shape[0]
 
-                # Append to per-feature lists
-                for feature_id in range(sae_acts.shape[-1]):
-                    feature_activations_list[feature_id].append(flat_acts[:, feature_id])
+                # Only extract activations for labeled features
+                for feature_id in labeled_feature_ids:
+                    feature_activations[feature_id].append(flat_acts[:, feature_id])
 
-        # Compute thresholds + firing rates for each feature
-        for feature_id in range(sae.cfg.d_sae):
+        # Compute thresholds + firing rates for labeled features only
+        for feature_id in labeled_feature_ids:
             # Concatenate all activations for this feature
-            feature_acts = torch.cat(feature_activations_list[feature_id], dim=0)
+            feature_acts = torch.cat(feature_activations[feature_id], dim=0)
             non_zero_acts = feature_acts[feature_acts > 0]
 
             if len(non_zero_acts) > 0:
@@ -1348,18 +1552,6 @@ def main():
 
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
-        # Discover feature-specific top tokens empirically
-        feature_top_tokens = discover_feature_tokens_empirical(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"],
-            threshold_percentile=80.0, top_k=15, logger=logger
-        )
-
-        # Skip this feature if no tokens were discovered
-        if len(feature_top_tokens) == 0:
-            logger.warning(f"  Skipping feature {feature_id} - no tokens discovered")
-            continue
-
         # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
             model, saes[layer], layer, feature_id, config["hook"],
@@ -1372,14 +1564,21 @@ def main():
             calibration_data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature's top-10 tokens (with dual filters)
-        stats = measure_probability_changes(
+        # UNIFIED: Discover promoted tokens + measure in single pass
+        unified_result = discover_and_measure_promoted_tokens(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, feature_top_tokens,
-            config["batch_size"], model.tokenizer,
+            test_data, config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            logger=logger
+            top_k=15, min_effect=0.0001, logger=logger
         )
+
+        # Skip if no promoted tokens found
+        if len(unified_result['promoted_tokens']) == 0:
+            logger.warning(f"  Skipping feature {feature_id} - no promoted tokens found")
+            continue
+
+        feature_top_tokens = unified_result['promoted_tokens']
+        stats = unified_result['measurement_stats']
 
         # Analyze per-feature tokens
         per_feature_analysis = analyze_per_feature_tokens(
