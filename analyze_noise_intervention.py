@@ -1212,35 +1212,23 @@ def main():
     model = loader.load_model()
     saes = loader.load_saes()
 
-    # Load calibration data
-    logger.info("Loading calibration corpus...")
-    calibration_loader = CorpusLoader(
-        corpus_name=config["corpus_name"],
-        max_passages=config["calibration_passages"],
-        max_len=config["max_len"],
-        tokenizer=model.tokenizer,
-        logger=logger
-    )
-    calibration_data, _ = calibration_loader.load_and_tokenize()
-    logger.info(f"Loaded {len(calibration_data)} calibration passages")
-
-    # Load test data
-    logger.info("Loading test corpus...")
-    test_loader = CorpusLoader(
+    # Load corpus (used for everything: thresholds, firing rates, measurement)
+    logger.info("Loading corpus...")
+    corpus_loader = CorpusLoader(
         corpus_name=config["corpus_name"],
         max_passages=config.get("test_passages", config["max_passages"]),
         max_len=config["max_len"],
         tokenizer=model.tokenizer,
         logger=logger
     )
-    test_data, _ = test_loader.load_and_tokenize()
-    logger.info(f"Loaded {len(test_data)} test passages")
+    data, _ = corpus_loader.load_and_tokenize()
+    logger.info(f"Loaded {len(data)} passages")
 
     # Load interpretability scores from CSV
     logger.info("Loading interpretability scores from neuronpedia_features.csv...")
     features_df = pd.read_csv("data/neuronpedia_features.csv")
 
-    # Get top features by activation (we'll compute this from calibration data)
+    # Get top features by activation
     logger.info("Computing average activations for all features...")
     feature_avg_activations = {}  # (layer, feature_id) -> avg_activation
     feature_max_activations = {}  # (layer, feature_id) -> max_activation (kept for logging)
@@ -1256,13 +1244,13 @@ def main():
         # Track max
         max_acts = []
 
-        # Process calibration data
-        num_batches = (len(calibration_data) + config["batch_size"] - 1) // config["batch_size"]
+        # Process corpus
+        num_batches = (len(data) + config["batch_size"] - 1) // config["batch_size"]
 
         for batch_idx in range(num_batches):
             batch_start = batch_idx * config["batch_size"]
-            batch_end = min(batch_start + config["batch_size"], len(calibration_data))
-            batch_tokens = calibration_data[batch_start:batch_end]
+            batch_end = min(batch_start + config["batch_size"], len(data))
+            batch_tokens = data[batch_start:batch_end]
             batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
             with torch.no_grad():
@@ -1314,7 +1302,7 @@ def main():
             logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
     # Compute firing rates ONLY for labeled features (not all 270k!)
-    logger.info("\nComputing firing rates for labeled features only (% of positions where feature activates above P65)...")
+    logger.info("\nComputing firing rates for labeled features (% of positions where feature activates above P65)...")
     feature_firing_rates = {}  # (layer, feature_id) -> firing_rate
 
     # Get all unique (layer, feature_id) pairs from CSV
@@ -1336,11 +1324,11 @@ def main():
         feature_activations = {fid: [] for fid in labeled_feature_ids}
         total_positions = 0
 
-        num_batches = (len(calibration_data) + config["batch_size"] - 1) // config["batch_size"]
+        num_batches = (len(data) + config["batch_size"] - 1) // config["batch_size"]
         for batch_idx in range(num_batches):
             batch_start = batch_idx * config["batch_size"]
-            batch_end = min(batch_start + config["batch_size"], len(calibration_data))
-            batch_tokens = calibration_data[batch_start:batch_end]
+            batch_end = min(batch_start + config["batch_size"], len(data))
+            batch_tokens = data[batch_start:batch_end]
             batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
 
             with torch.no_grad():
@@ -1375,10 +1363,15 @@ def main():
             else:
                 feature_firing_rates[(layer, feature_id)] = 0.0
 
-    # Select top K features by COMPOSITE SCORE (interpretability + firing rate) PER LAYER
+    # Select top K features by TWO-STAGE FILTER (frequent + interpretable) PER LAYER
     top_by_interpretability_list = []
-    logger.info(f"\nTop {args.top_k_interpretability} features by COMPOSITE SCORE (interpretability × firing rate) per layer:")
-    logger.info(f"  Minimum thresholds: confidence >= 0.65, firing_rate >= 0.0005 (0.05%)")
+    min_conf = config.get("min_confidence", 0.70)
+    min_firing_pct = config.get("min_firing_percentile", 75) / 100.0  # Convert to decimal
+
+    logger.info(f"\nTop {args.top_k_interpretability} features by TWO-STAGE FILTER per layer:")
+    logger.info(f"  Stage 1: confidence >= {min_conf:.2f} AND firing_rate >= P{int(min_firing_pct*100)}")
+    logger.info(f"  Stage 2: Select top-{args.top_k_interpretability} by confidence")
+
     for layer in config["layers"]:
         # Get features for this layer from CSV
         layer_features = features_df[features_df["layer"] == layer].copy()
@@ -1401,27 +1394,22 @@ def main():
             axis=1
         )
 
-        # Filter for minimum quality: confidence >= 0.65 AND firing_rate >= 0.0005 (0.05%)
+        # Compute firing rate percentile within this layer
+        layer_features["firing_rate_pct"] = layer_features["firing_rate"].rank(pct=True)
+
+        # TWO-STAGE FILTER:
+        # Stage 1: Keep only features that are interpretable AND fire frequently
         valid_features = layer_features[
-            (layer_features["label_confidence"] >= 0.65) &
-            (layer_features["firing_rate"] >= 0.0005)
+            (layer_features["label_confidence"] >= min_conf) &
+            (layer_features["firing_rate_pct"] >= min_firing_pct)
         ].copy()
 
         if len(valid_features) == 0:
             logger.info(f"  Layer {layer}: No features meeting minimum thresholds")
             continue
 
-        # Compute firing rate percentile within this layer
-        valid_features["firing_rate_pct"] = valid_features["firing_rate"].rank(pct=True)
-
-        # Composite score: confidence * sqrt(firing_rate_percentile)
-        valid_features["composite_score"] = (
-            valid_features["label_confidence"] *
-            np.sqrt(valid_features["firing_rate_pct"])
-        )
-
-        # Select top K by composite score
-        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "composite_score")
+        # Stage 2: Select top K by confidence (among frequent features)
+        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "label_confidence")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
@@ -1430,8 +1418,8 @@ def main():
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
-                    f"score={row['composite_score']:.3f} "
-                    f"(conf={row['label_confidence']:.2f}, fire={row['firing_rate']:.4f}={row['firing_rate']*100:.2f}%), "
+                    f"conf={row['label_confidence']:.2f} "
+                    f"(fire={row['firing_rate']:.4f}={row['firing_rate']*100:.2f}%, P{int(row['firing_rate_pct']*100)}), "
                     f"label='{row['label']}'"
                 )
         else:
@@ -1454,43 +1442,38 @@ def main():
     for (layer, feature_id), activation in top_by_activation:
         logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
 
-        # Discover feature-specific top tokens empirically
-        feature_top_tokens = discover_feature_tokens_empirical(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"],
-            threshold_percentile=80.0, top_k=15, logger=logger
-        )
-
-        # Skip this feature if no tokens were discovered
-        if len(feature_top_tokens) == 0:
-            logger.warning(f"  Skipping feature {feature_id} - no tokens discovered")
-            continue
-
         # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], percentile=65.0, logger=logger
+            data, config["batch_size"], percentile=65.0, logger=logger
         )
 
         # Measure KLD from ablation
         ablation_kld = measure_kld_with_ablation(
             model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], logger=logger
+            data, config["batch_size"], logger=logger
         )
 
-        # Measure probability changes on TARGET feature's top-10 tokens (with dual filters)
-        stats = measure_probability_changes(
+        # UNIFIED: Discover promoted tokens + measure in single pass
+        unified_result = discover_and_measure_promoted_tokens(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, feature_top_tokens,
-            config["batch_size"], model.tokenizer,
+            data, config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
-            logger=logger
+            top_k=15, min_effect=0.0001, logger=logger
         )
 
-        # Analyze per-feature tokens
+        # Skip if no promoted tokens found
+        if len(unified_result['promoted_tokens']) == 0:
+            logger.warning(f"  Skipping feature {feature_id} - no promoted tokens found")
+            continue
+
+        feature_top_tokens = unified_result['promoted_tokens']
+        stats = unified_result['measurement_stats']
+
+        # Analyze per-feature tokens (full vocabulary analysis)
         per_feature_analysis = analyze_per_feature_tokens(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, config["batch_size"], model.tokenizer,
+            data, config["batch_size"], model.tokenizer,
             top_k=20, logger=logger
         )
 
@@ -1521,7 +1504,7 @@ def main():
         # Use the SAME feature-specific tokens and SAME filters for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
-            test_data, feature_top_tokens,
+            data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
             logger=logger
