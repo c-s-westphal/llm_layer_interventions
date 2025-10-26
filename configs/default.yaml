@@ -20,8 +20,8 @@ max_len: 256  # Maximum token length per passage
 # Feature selection
 feature_source: "csv"  # Options: "csv", "neuronpedia_api", "static"
 neuronpedia_token: null  # Set via CLI or env var if using API
-min_confidence: 0.70  # Minimum label confidence for interpretable features
-min_firing_percentile: 30  # Only consider features in top N% of firing rates (two-stage filter) - P30 means above 30% of features
+min_confidence: 0.50  # Minimum label confidence for interpretable features
+# Composite score: (firing_rate_percentile + activation_percentile) / 2
 top_k: 3  # Number of features to select per layer
 
 # Computation settings

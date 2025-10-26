@@ -1228,15 +1228,16 @@ def main():
     logger.info("Loading interpretability scores from neuronpedia_features.csv...")
     features_df = pd.read_csv("data/neuronpedia_features.csv")
 
-    # Compute firing rates ONLY for labeled features (not all 270k!)
-    logger.info("\nComputing firing rates for labeled features (% of positions where feature activates above P65)...")
+    # Compute firing rates AND average activations for labeled features (not all 270k!)
+    logger.info("\nComputing firing rates and average activations for labeled features...")
     feature_firing_rates = {}  # (layer, feature_id) -> firing_rate
+    feature_avg_activations = {}  # (layer, feature_id) -> avg_activation
 
     # Get all unique (layer, feature_id) pairs from CSV
     labeled_features = features_df[['layer', 'feature_id']].drop_duplicates()
-    logger.info(f"  Computing firing rates for {len(labeled_features)} labeled features")
+    logger.info(f"  Computing metrics for {len(labeled_features)} labeled features")
 
-    for layer in tqdm(config["layers"], desc="Computing firing rates"):
+    for layer in tqdm(config["layers"], desc="Computing metrics"):
         # Only process features that have labels in this layer
         layer_labeled = labeled_features[labeled_features['layer'] == layer]
 
@@ -1277,12 +1278,17 @@ def main():
                 for feature_id in labeled_feature_ids:
                     feature_activations[feature_id].append(flat_acts[:, feature_id])
 
-        # Compute thresholds + firing rates for labeled features only
+        # Compute firing rates AND average activations for labeled features
         for feature_id in labeled_feature_ids:
             # Concatenate all activations for this feature
             feature_acts = torch.cat(feature_activations[feature_id], dim=0)
-            non_zero_acts = feature_acts[feature_acts > 0]
 
+            # Average activation
+            avg_activation = float(feature_acts.mean())
+            feature_avg_activations[(layer, feature_id)] = avg_activation
+
+            # Firing rate (% positions > P65 threshold)
+            non_zero_acts = feature_acts[feature_acts > 0]
             if len(non_zero_acts) > 0:
                 threshold = float(np.percentile(non_zero_acts.numpy(), 65.0))
                 firing_rate = (feature_acts > threshold).sum().item() / total_positions
@@ -1290,14 +1296,14 @@ def main():
             else:
                 feature_firing_rates[(layer, feature_id)] = 0.0
 
-    # Select top K features by TWO-STAGE FILTER (frequent + interpretable) PER LAYER
+    # Select top K features by COMPOSITE SCORE per layer
     top_by_interpretability_list = []
-    min_conf = config.get("min_confidence", 0.70)
-    min_firing_pct = config.get("min_firing_percentile", 30) / 100.0  # Convert to decimal
+    min_conf = config.get("min_confidence", 0.50)
 
-    logger.info(f"\nTop {args.top_k_interpretability} features by TWO-STAGE FILTER per layer:")
-    logger.info(f"  Stage 1: confidence >= {min_conf:.2f} AND firing_rate >= P{int(min_firing_pct*100)}")
-    logger.info(f"  Stage 2: Select top-{args.top_k_interpretability} by confidence")
+    logger.info(f"\nTop {args.top_k_interpretability} features by COMPOSITE SCORE per layer:")
+    logger.info(f"  Filter: confidence >= {min_conf:.2f}")
+    logger.info(f"  Score: (firing_rate_percentile + activation_percentile) / 2")
+    logger.info(f"  Selection: top-{args.top_k_interpretability} by composite score")
 
     for layer in config["layers"]:
         # Get features for this layer from CSV
@@ -1307,28 +1313,36 @@ def main():
             logger.info(f"  Layer {layer}: No labeled features found")
             continue
 
-        # Add firing rate data
+        # Add firing rate and activation data
         layer_features["firing_rate"] = layer_features.apply(
             lambda row: feature_firing_rates.get((layer, int(row["feature_id"])), 0.0),
             axis=1
         )
+        layer_features["avg_activation"] = layer_features.apply(
+            lambda row: feature_avg_activations.get((layer, int(row["feature_id"])), 0.0),
+            axis=1
+        )
 
-        # Compute firing rate percentile within this layer
+        # Compute percentiles within this layer
         layer_features["firing_rate_pct"] = layer_features["firing_rate"].rank(pct=True)
+        layer_features["activation_pct"] = layer_features["avg_activation"].rank(pct=True)
 
-        # TWO-STAGE FILTER:
-        # Stage 1: Keep only features that are interpretable AND fire frequently
+        # Composite score: average of percentiles
+        layer_features["composite_score"] = (
+            layer_features["firing_rate_pct"] + layer_features["activation_pct"]
+        ) / 2.0
+
+        # Filter by minimum confidence
         valid_features = layer_features[
-            (layer_features["label_confidence"] >= min_conf) &
-            (layer_features["firing_rate_pct"] >= min_firing_pct)
+            layer_features["label_confidence"] >= min_conf
         ].copy()
 
         if len(valid_features) == 0:
-            logger.info(f"  Layer {layer}: No features meeting minimum thresholds")
+            logger.info(f"  Layer {layer}: No features meeting minimum confidence")
             continue
 
-        # Stage 2: Select top K by confidence (among frequent features)
-        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "label_confidence")
+        # Select top K by composite score
+        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "composite_score")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
@@ -1337,8 +1351,9 @@ def main():
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
-                    f"conf={row['label_confidence']:.2f} "
-                    f"(fire={row['firing_rate']:.4f}={row['firing_rate']*100:.2f}%, P{int(row['firing_rate_pct']*100)}), "
+                    f"conf={row['label_confidence']:.2f}, "
+                    f"composite_score={row['composite_score']:.3f} "
+                    f"(fire_pct=P{int(row['firing_rate_pct']*100)}, act_pct=P{int(row['activation_pct']*100)}), "
                     f"label='{row['label']}'"
                 )
         else:
