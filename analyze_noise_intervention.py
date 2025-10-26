@@ -1167,7 +1167,7 @@ def main():
     parser = argparse.ArgumentParser(description="Ablation-based feature intervention analysis")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--top_k_activation", type=int, default=5, help="Top K features by activation")
-    parser.add_argument("--top_k_interpretability", type=int, default=5, help="Top K features by interpretability")
+    parser.add_argument("--top_k_interpretability", type=int, default=3, help="Top K features by interpretability")
     args = parser.parse_args()
 
     # Load config
@@ -1227,79 +1227,6 @@ def main():
     # Load interpretability scores from CSV
     logger.info("Loading interpretability scores from neuronpedia_features.csv...")
     features_df = pd.read_csv("data/neuronpedia_features.csv")
-
-    # Get top features by activation
-    logger.info("Computing average activations for all features...")
-    feature_avg_activations = {}  # (layer, feature_id) -> avg_activation
-    feature_max_activations = {}  # (layer, feature_id) -> max_activation (kept for logging)
-
-    for layer in tqdm(config["layers"], desc="Computing activations"):
-        sae = saes[layer]
-        hook_name = f"blocks.{layer}.hook_{config['hook']}"
-
-        # Accumulate sums and counts for average
-        activation_sum = None
-        total_positions = 0
-
-        # Track max
-        max_acts = []
-
-        # Process corpus
-        num_batches = (len(data) + config["batch_size"] - 1) // config["batch_size"]
-
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * config["batch_size"]
-            batch_end = min(batch_start + config["batch_size"], len(data))
-            batch_tokens = data[batch_start:batch_end]
-            batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
-
-            with torch.no_grad():
-                _, cache = model.run_with_cache(
-                    batch_dict["input_ids"],
-                    names_filter=[hook_name]
-                )
-                acts = cache[hook_name]
-                sae_acts = sae.encode(acts)  # [batch, seq, d_sae]
-
-                # Compute average: sum over batch and seq
-                mask = batch_dict["attention_mask"]
-                num_valid = mask.sum().item()
-
-                # Sum activations
-                batch_sum = sae_acts.sum(dim=(0, 1))  # [d_sae]
-                if activation_sum is None:
-                    activation_sum = batch_sum.cpu()
-                else:
-                    activation_sum += batch_sum.cpu()
-                total_positions += num_valid
-
-                # Get max activation per feature across this batch
-                batch_max = sae_acts.reshape(-1, sae_acts.shape[-1]).max(dim=0).values
-                max_acts.append(batch_max.cpu())
-
-        # Compute average activation per feature
-        avg_activations = activation_sum / total_positions
-
-        # Overall max per feature
-        overall_max = torch.stack(max_acts).max(dim=0).values
-
-        for feature_id in range(avg_activations.shape[0]):
-            feature_avg_activations[(layer, feature_id)] = avg_activations[feature_id].item()
-            feature_max_activations[(layer, feature_id)] = overall_max[feature_id].item()
-
-    # Select top K features by MAX activation PER LAYER
-    top_by_activation = []
-    logger.info(f"\nTop {args.top_k_activation} features by max activation per layer:")
-    for layer in config["layers"]:
-        # Get features for this layer
-        layer_features = {(l, f): act for (l, f), act in feature_max_activations.items() if l == layer}
-        # Sort and take top K
-        top_k = sorted(layer_features.items(), key=lambda x: x[1], reverse=True)[:args.top_k_activation]
-        top_by_activation.extend(top_k)
-
-        logger.info(f"  Layer {layer}:")
-        for (l, feature_id), activation in top_k:
-            logger.info(f"    Feature {feature_id}: max_act={activation:.4f}")
 
     # Compute firing rates ONLY for labeled features (not all 270k!)
     logger.info("\nComputing firing rates for labeled features (% of positions where feature activates above P65)...")
@@ -1366,7 +1293,7 @@ def main():
     # Select top K features by TWO-STAGE FILTER (frequent + interpretable) PER LAYER
     top_by_interpretability_list = []
     min_conf = config.get("min_confidence", 0.70)
-    min_firing_pct = config.get("min_firing_percentile", 75) / 100.0  # Convert to decimal
+    min_firing_pct = config.get("min_firing_percentile", 30) / 100.0  # Convert to decimal
 
     logger.info(f"\nTop {args.top_k_interpretability} features by TWO-STAGE FILTER per layer:")
     logger.info(f"  Stage 1: confidence >= {min_conf:.2f} AND firing_rate >= P{int(min_firing_pct*100)}")
@@ -1380,15 +1307,7 @@ def main():
             logger.info(f"  Layer {layer}: No labeled features found")
             continue
 
-        # Add activation and firing rate data
-        layer_features["avg_activation"] = layer_features.apply(
-            lambda row: feature_avg_activations.get((layer, int(row["feature_id"])), 0.0),
-            axis=1
-        )
-        layer_features["max_activation"] = layer_features.apply(
-            lambda row: feature_max_activations.get((layer, int(row["feature_id"])), 0.0),
-            axis=1
-        )
+        # Add firing rate data
         layer_features["firing_rate"] = layer_features.apply(
             lambda row: feature_firing_rates.get((layer, int(row["feature_id"])), 0.0),
             axis=1
@@ -1433,14 +1352,21 @@ def main():
 
     # Process features
     results = []
-    per_feature_token_results = []
+
+    # REMOVED: Activation-based feature processing
+    # Only processing interpretable features with confidence >= 0.70 and firing_rate >= P30
 
     logger.info("\n" + "="*80)
-    logger.info("PROCESSING FEATURES BY ACTIVATION")
+    logger.info("PROCESSING FEATURES BY INTERPRETABILITY")
     logger.info("="*80)
 
-    for (layer, feature_id), activation in top_by_activation:
-        logger.info(f"\n--- Layer {layer}, Feature {feature_id} (max activation={activation:.4f}) ---")
+    for _, row in top_by_interpretability.iterrows():
+        layer = int(row["layer"])
+        feature_id = int(row["feature_id"])
+        label = row["label"]
+        conf = row["label_confidence"]
+
+        logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
 
         # Calibrate P65 threshold for this feature
         feature_threshold = calibrate_feature_threshold(
@@ -1470,138 +1396,14 @@ def main():
         feature_top_tokens = unified_result['promoted_tokens']
         stats = unified_result['measurement_stats']
 
-        # Analyze per-feature tokens (full vocabulary analysis)
-        per_feature_analysis = analyze_per_feature_tokens(
-            model, saes[layer], layer, feature_id, config["hook"],
-            data, config["batch_size"], model.tokenizer,
-            top_k=20, logger=logger
-        )
-
-        # Store per-feature token results
-        for token_info in per_feature_analysis["promoted_tokens"]:
-            per_feature_token_results.append({
-                "layer": layer,
-                "feature_id": feature_id,
-                "selection_method": "activation",
-                "direction": "promoted",
-                "token_id": token_info["token_id"],
-                "token_str": token_info["token_str"],
-                "avg_change": token_info["avg_change"]
-            })
-
-        for token_info in per_feature_analysis["suppressed_tokens"]:
-            per_feature_token_results.append({
-                "layer": layer,
-                "feature_id": feature_id,
-                "selection_method": "activation",
-                "direction": "suppressed",
-                "token_id": token_info["token_id"],
-                "token_str": token_info["token_str"],
-                "avg_change": token_info["avg_change"]
-            })
+        # REMOVED: analyze_per_feature_tokens (duplicate work - saves ~188 forward passes per feature)
+        # Console still logs promoted/suppressed tokens from discover_and_measure_promoted_tokens above
 
         # Measure probability changes on RANDOM feature (control)
         # Use the SAME feature-specific tokens and SAME filters for fair comparison
         control_stats = measure_probability_changes_random_control(
             model, saes[layer], layer, feature_id, config["hook"],
             data, feature_top_tokens,
-            config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold,
-            logger=logger
-        )
-
-        # Prefix control stats
-        control_stats_prefixed = {f"control_{k}": v for k, v in control_stats.items()}
-
-        results.append({
-            "layer": layer,
-            "feature_id": feature_id,
-            "selection_method": "activation",
-            "max_activation": activation,
-            "ablation_kld": ablation_kld,
-            **stats,
-            **control_stats_prefixed
-        })
-
-    logger.info("\n" + "="*80)
-    logger.info("PROCESSING FEATURES BY INTERPRETABILITY")
-    logger.info("="*80)
-
-    for _, row in top_by_interpretability.iterrows():
-        layer = int(row["layer"])
-        feature_id = int(row["feature_id"])
-        label = row["label"]
-        conf = row["label_confidence"]
-
-        logger.info(f"\n--- Layer {layer}, Feature {feature_id} ('{label}', conf={conf:.2f}) ---")
-
-        # Calibrate P65 threshold for this feature
-        feature_threshold = calibrate_feature_threshold(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], percentile=65.0, logger=logger
-        )
-
-        # Measure KLD from ablation
-        ablation_kld = measure_kld_with_ablation(
-            model, saes[layer], layer, feature_id, config["hook"],
-            calibration_data, config["batch_size"], logger=logger
-        )
-
-        # UNIFIED: Discover promoted tokens + measure in single pass
-        unified_result = discover_and_measure_promoted_tokens(
-            model, saes[layer], layer, feature_id, config["hook"],
-            test_data, config["batch_size"], model.tokenizer,
-            activation_threshold=feature_threshold,
-            top_k=15, min_effect=0.0001, logger=logger
-        )
-
-        # Skip if no promoted tokens found
-        if len(unified_result['promoted_tokens']) == 0:
-            logger.warning(f"  Skipping feature {feature_id} - no promoted tokens found")
-            continue
-
-        feature_top_tokens = unified_result['promoted_tokens']
-        stats = unified_result['measurement_stats']
-
-        # Analyze per-feature tokens
-        per_feature_analysis = analyze_per_feature_tokens(
-            model, saes[layer], layer, feature_id, config["hook"],
-            test_data, config["batch_size"], model.tokenizer,
-            top_k=20, logger=logger
-        )
-
-        # Store per-feature token results with label
-        for token_info in per_feature_analysis["promoted_tokens"]:
-            per_feature_token_results.append({
-                "layer": layer,
-                "feature_id": feature_id,
-                "selection_method": "interpretability",
-                "label": label,
-                "label_confidence": conf,
-                "direction": "promoted",
-                "token_id": token_info["token_id"],
-                "token_str": token_info["token_str"],
-                "avg_change": token_info["avg_change"]
-            })
-
-        for token_info in per_feature_analysis["suppressed_tokens"]:
-            per_feature_token_results.append({
-                "layer": layer,
-                "feature_id": feature_id,
-                "selection_method": "interpretability",
-                "label": label,
-                "label_confidence": conf,
-                "direction": "suppressed",
-                "token_id": token_info["token_id"],
-                "token_str": token_info["token_str"],
-                "avg_change": token_info["avg_change"]
-            })
-
-        # Measure probability changes on RANDOM feature (control)
-        # Use the SAME feature-specific tokens and SAME filters for fair comparison
-        control_stats = measure_probability_changes_random_control(
-            model, saes[layer], layer, feature_id, config["hook"],
-            test_data, feature_top_tokens,
             config["batch_size"], model.tokenizer,
             activation_threshold=feature_threshold,
             logger=logger
@@ -1627,11 +1429,7 @@ def main():
     results_df.to_csv(results_path, index=False)
     logger.info(f"\nResults saved to: {results_path}")
 
-    # Save per-feature token results
-    per_feature_tokens_df = pd.DataFrame(per_feature_token_results)
-    per_feature_tokens_path = output_dir / "per_feature_tokens.csv"
-    per_feature_tokens_df.to_csv(per_feature_tokens_path, index=False)
-    logger.info(f"Per-feature token analysis saved to: {per_feature_tokens_path}")
+    # REMOVED: per_feature_tokens.csv output (saved ~188 forward passes per feature)
 
     # Summary
     logger.info("\n" + "="*80)
