@@ -189,11 +189,13 @@ def measure_feature_ablation_effect(
             baseline_prob_dist = baseline_probs[batch_pos, seq_pos]  # [vocab]
             ablated_prob_dist = ablated_probs[batch_pos, seq_pos]    # [vocab]
 
-            # Find tokens that were promoted by this feature
-            prob_change = baseline_prob_dist - ablated_prob_dist  # Positive = feature promoted
+            # Compute RELATIVE probability change: (baseline - ablated) / baseline
+            # Add epsilon to avoid division by zero
+            relative_change = (baseline_prob_dist - ablated_prob_dist) / (baseline_prob_dist + 1e-10)
+            # Positive = feature promoted this token (ablation reduces its probability)
 
-            # Store top promoted token changes
-            top_promoted = prob_change.topk(10)
+            # Store top promoted token changes (by relative reduction)
+            top_promoted = relative_change.topk(10)
             all_prob_changes.extend(top_promoted.values.cpu().numpy())
 
     # Compute statistics
@@ -203,11 +205,11 @@ def measure_feature_ablation_effect(
         'feature_id': feature_id,
         'layer': layer,
         'num_positions': len(positions),
-        'mean_prob_change': float(prob_changes_array.mean()),
-        'median_prob_change': float(np.median(prob_changes_array)),
-        'std_prob_change': float(prob_changes_array.std()),
-        'max_prob_change': float(prob_changes_array.max()),
-        'min_prob_change': float(prob_changes_array.min()),
+        'mean_relative_change': float(prob_changes_array.mean()),
+        'median_relative_change': float(np.median(prob_changes_array)),
+        'std_relative_change': float(prob_changes_array.std()),
+        'max_relative_change': float(prob_changes_array.max()),
+        'min_relative_change': float(prob_changes_array.min()),
     }
 
     return stats
@@ -311,28 +313,30 @@ def main():
 
     # Summary statistics
     logger.info("\n" + "="*80)
-    logger.info("SUMMARY")
+    logger.info("SUMMARY (RELATIVE PROBABILITY CHANGES)")
     logger.info("="*80)
     logger.info(f"Total features analyzed: {len(results_df)}")
-    logger.info(f"Overall mean probability change: {results_df['mean_prob_change'].mean():.6f}")
-    logger.info(f"Overall median probability change: {results_df['median_prob_change'].mean():.6f}")
+    logger.info(f"Overall mean relative change: {results_df['mean_relative_change'].mean():.4f} ({results_df['mean_relative_change'].mean()*100:.2f}%)")
+    logger.info(f"Overall median relative change: {results_df['median_relative_change'].mean():.4f} ({results_df['median_relative_change'].mean()*100:.2f}%)")
+    logger.info(f"\nInterpretation: A value of 0.50 means ablating the feature reduces")
+    logger.info(f"promoted token probability by 50% (e.g., 10% -> 5%)")
 
     logger.info(f"\nPer-Layer Statistics:")
     for layer in sorted(results_df['layer'].unique()):
         layer_results = results_df[results_df['layer'] == layer]
         logger.info(
             f"  Layer {layer}: n={len(layer_results)}, "
-            f"mean={layer_results['mean_prob_change'].mean():.6f}, "
-            f"median={layer_results['median_prob_change'].mean():.6f}, "
-            f"max={layer_results['mean_prob_change'].max():.6f}"
+            f"mean={layer_results['mean_relative_change'].mean():.4f} ({layer_results['mean_relative_change'].mean()*100:.1f}%), "
+            f"median={layer_results['median_relative_change'].mean():.4f}, "
+            f"max={layer_results['mean_relative_change'].max():.4f} ({layer_results['mean_relative_change'].max()*100:.1f}%)"
         )
 
     logger.info(f"\nTop 10 features by effect size:")
-    top_features = results_df.nlargest(10, 'mean_prob_change')
+    top_features = results_df.nlargest(10, 'mean_relative_change')
     for _, row in top_features.iterrows():
         logger.info(
             f"  Layer {row['layer']}, Feature {row['feature_id']}: "
-            f"mean_change={row['mean_prob_change']:.6f}, "
+            f"mean_change={row['mean_relative_change']:.4f} ({row['mean_relative_change']*100:.1f}%), "
             f"positions={row['num_positions']}"
         )
 
