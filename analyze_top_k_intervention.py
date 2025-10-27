@@ -314,8 +314,19 @@ def main():
     logger.info("SUMMARY")
     logger.info("="*80)
     logger.info(f"Total features analyzed: {len(results_df)}")
-    logger.info(f"Mean probability change: {results_df['mean_prob_change'].mean():.6f}")
-    logger.info(f"Median probability change: {results_df['median_prob_change'].mean():.6f}")
+    logger.info(f"Overall mean probability change: {results_df['mean_prob_change'].mean():.6f}")
+    logger.info(f"Overall median probability change: {results_df['median_prob_change'].mean():.6f}")
+
+    logger.info(f"\nPer-Layer Statistics:")
+    for layer in sorted(results_df['layer'].unique()):
+        layer_results = results_df[results_df['layer'] == layer]
+        logger.info(
+            f"  Layer {layer}: n={len(layer_results)}, "
+            f"mean={layer_results['mean_prob_change'].mean():.6f}, "
+            f"median={layer_results['median_prob_change'].mean():.6f}, "
+            f"max={layer_results['mean_prob_change'].max():.6f}"
+        )
+
     logger.info(f"\nTop 10 features by effect size:")
     top_features = results_df.nlargest(10, 'mean_prob_change')
     for _, row in top_features.iterrows():
