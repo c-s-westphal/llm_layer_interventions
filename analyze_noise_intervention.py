@@ -1298,10 +1298,9 @@ def main():
 
     # Select top K features by COMPOSITE SCORE per layer
     top_by_interpretability_list = []
-    min_conf = config.get("min_confidence", 0.50)
 
     logger.info(f"\nTop {args.top_k_interpretability} features by COMPOSITE SCORE per layer:")
-    logger.info(f"  Filter: confidence >= {min_conf:.2f}")
+    logger.info(f"  Filter: None (all labeled features considered)")
     logger.info(f"  Score: (firing_rate_percentile + activation_percentile) / 2")
     logger.info(f"  Selection: top-{args.top_k_interpretability} by composite score")
 
@@ -1332,17 +1331,8 @@ def main():
             layer_features["firing_rate_pct"] + layer_features["activation_pct"]
         ) / 2.0
 
-        # Filter by minimum confidence
-        valid_features = layer_features[
-            layer_features["label_confidence"] >= min_conf
-        ].copy()
-
-        if len(valid_features) == 0:
-            logger.info(f"  Layer {layer}: No features meeting minimum confidence")
-            continue
-
-        # Select top K by composite score
-        top_k = valid_features.nlargest(min(args.top_k_interpretability, len(valid_features)), "composite_score")
+        # Select top K by composite score (no confidence filter)
+        top_k = layer_features.nlargest(min(args.top_k_interpretability, len(layer_features)), "composite_score")
 
         if len(top_k) > 0:
             top_by_interpretability_list.append(top_k)
@@ -1351,13 +1341,13 @@ def main():
             for _, row in top_k.iterrows():
                 logger.info(
                     f"    Feature {row['feature_id']}: "
-                    f"conf={row['label_confidence']:.2f}, "
                     f"composite_score={row['composite_score']:.3f} "
                     f"(fire_pct=P{int(row['firing_rate_pct']*100)}, act_pct=P{int(row['activation_pct']*100)}), "
+                    f"conf={row['label_confidence']:.2f}, "
                     f"label='{row['label']}'"
                 )
         else:
-            logger.info(f"  Layer {layer}: No features meeting minimum thresholds")
+            logger.info(f"  Layer {layer}: No labeled features found")
 
     # Concatenate all layers
     if top_by_interpretability_list:
