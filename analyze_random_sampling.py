@@ -181,19 +181,31 @@ def measure_ablation_effects(
                 baseline_prob_dist = baseline_probs[batch_pos, seq_pos]
                 ablated_prob_dist = ablated_probs[batch_pos, seq_pos]
 
-                # Compute both relative and absolute change for top promoted token
+                # Compute both relative and absolute change
                 absolute_change = (baseline_prob_dist - ablated_prob_dist)
                 relative_change = absolute_change / (baseline_prob_dist + 1e-10)
 
-                top_abs = absolute_change.max().item()
-                top_rel = relative_change.max().item()
+                # Approach 1: Top-10 token (max relative change)
+                top_10_rel = relative_change.topk(10).values.mean().item()
+                top_10_abs = absolute_change.topk(10).values.mean().item()
+
+                # Approach 2: All positive tokens (mean of all positive changes)
+                positive_mask = relative_change > 0
+                if positive_mask.any():
+                    all_pos_rel = relative_change[positive_mask].mean().item()
+                    all_pos_abs = absolute_change[positive_mask].mean().item()
+                else:
+                    all_pos_rel = 0.0
+                    all_pos_abs = 0.0
 
                 all_measurements.append({
                     'feature_id': feature_id,
                     'activation': feature_act,
                     'co_activation_count': co_activation_count,
-                    'relative_change': top_rel,
-                    'absolute_change': top_abs
+                    'relative_change_top10': top_10_rel,
+                    'absolute_change_top10': top_10_abs,
+                    'relative_change_allpos': all_pos_rel,
+                    'absolute_change_allpos': all_pos_abs
                 })
 
     return pd.DataFrame(all_measurements)
@@ -303,6 +315,7 @@ def main():
     logger.info("ANALYSIS")
     logger.info("="*80)
 
+    # Per-layer detailed analysis
     for layer in range(1, 12):
         layer_df = results_df[results_df['layer'] == layer]
 
@@ -312,46 +325,140 @@ def main():
 
         logger.info(f"\nOverall Statistics (all {args.num_features} random features):")
         logger.info(f"  Total measurements: {len(layer_df):,}")
-        logger.info(f"  Mean relative change: {layer_df['relative_change'].mean():.4f} ({layer_df['relative_change'].mean()*100:.1f}%)")
-        logger.info(f"  Mean absolute change: {layer_df['absolute_change'].mean():.6f}")
-        logger.info(f"  Median relative change: {layer_df['relative_change'].median():.4f}")
-        logger.info(f"  Median absolute change: {layer_df['absolute_change'].median():.6f}")
 
-        logger.info(f"\nTop-K by Metric Value (Relative Change):")
-        for k in [5, 10, 20]:
-            if len(layer_df) >= k:
-                top_k = layer_df.nlargest(k, 'relative_change')
-                logger.info(
-                    f"  Top-{k}: mean_rel={top_k['relative_change'].mean():.4f} ({top_k['relative_change'].mean()*100:.1f}%), "
-                    f"mean_abs={top_k['absolute_change'].mean():.6f}"
-                )
+        logger.info(f"\n  TOP-10 TOKEN APPROACH:")
+        logger.info(f"    Mean relative change: {layer_df['relative_change_top10'].mean():.4f} ({layer_df['relative_change_top10'].mean()*100:.1f}%)")
+        logger.info(f"    Mean absolute change: {layer_df['absolute_change_top10'].mean():.6f}")
+        logger.info(f"    Median relative change: {layer_df['relative_change_top10'].median():.4f}")
 
-        logger.info(f"\nTop-K by Activation Value:")
-        for k in [5, 10, 20]:
-            if len(layer_df) >= k:
-                top_k = layer_df.nlargest(k, 'activation')
-                logger.info(
-                    f"  Top-{k}: mean_rel={top_k['relative_change'].mean():.4f} ({top_k['relative_change'].mean()*100:.1f}%), "
-                    f"mean_abs={top_k['absolute_change'].mean():.6f}, "
-                    f"mean_activation={top_k['activation'].mean():.2f}"
-                )
+        logger.info(f"\n  ALL POSITIVE TOKENS APPROACH:")
+        logger.info(f"    Mean relative change: {layer_df['relative_change_allpos'].mean():.4f} ({layer_df['relative_change_allpos'].mean()*100:.1f}%)")
+        logger.info(f"    Mean absolute change: {layer_df['absolute_change_allpos'].mean():.6f}")
+        logger.info(f"    Median relative change: {layer_df['relative_change_allpos'].median():.4f}")
 
+    # Cross-layer analysis
     logger.info("\n" + "="*80)
-    logger.info("CROSS-LAYER SUMMARY")
+    logger.info("CROSS-LAYER ANALYSIS")
     logger.info("="*80)
 
-    logger.info(f"\nMean Relative Change by Layer:")
+    logger.info("\n" + "="*80)
+    logger.info("TOP-10 TOKEN APPROACH")
+    logger.info("="*80)
+
+    logger.info(f"\nTop-K by Metric Value (Relative Change):")
+    logger.info(f"\n  Top-5 features per layer:")
     for layer in range(1, 12):
         layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(5, 'relative_change_top10')
         logger.info(
-            f"  Layer {layer}: {layer_df['relative_change'].mean():.4f} ({layer_df['relative_change'].mean()*100:.1f}%)"
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}"
         )
 
-    logger.info(f"\nMean Absolute Change by Layer:")
+    logger.info(f"\n  Top-10 features per layer:")
     for layer in range(1, 12):
         layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(10, 'relative_change_top10')
         logger.info(
-            f"  Layer {layer}: {layer_df['absolute_change'].mean():.6f}"
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}"
+        )
+
+    logger.info(f"\n  Top-20 features per layer:")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(20, 'relative_change_top10')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}"
+        )
+
+    logger.info(f"\nTop-K by Activation Value:")
+    logger.info(f"\n  Top-5 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(5, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
+        )
+
+    logger.info(f"\n  Top-10 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(10, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
+        )
+
+    logger.info(f"\n  Top-20 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(20, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_top10'].mean():.4f} ({top_k['relative_change_top10'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_top10'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
+        )
+
+    logger.info("\n" + "="*80)
+    logger.info("ALL POSITIVE TOKENS APPROACH")
+    logger.info("="*80)
+
+    logger.info(f"\nTop-K by Metric Value (Relative Change):")
+    logger.info(f"\n  Top-5 features per layer:")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(5, 'relative_change_allpos')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}"
+        )
+
+    logger.info(f"\n  Top-10 features per layer:")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(10, 'relative_change_allpos')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}"
+        )
+
+    logger.info(f"\n  Top-20 features per layer:")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(20, 'relative_change_allpos')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}"
+        )
+
+    logger.info(f"\nTop-K by Activation Value:")
+    logger.info(f"\n  Top-5 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(5, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
+        )
+
+    logger.info(f"\n  Top-10 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(10, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
+        )
+
+    logger.info(f"\n  Top-20 features per layer (by activation):")
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        top_k = layer_df.nlargest(20, 'activation')
+        logger.info(
+            f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
+            f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
         )
 
     logger.info("\nDone!")
