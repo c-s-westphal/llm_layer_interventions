@@ -2,14 +2,15 @@
 """
 Random Feature Sampling Ablation Analysis
 
-At each position in the corpus:
-1. Randomly sample 60 features (different random 60 per position)
-2. Ablate each of the 60 features
-3. Measure both relative and absolute probability change
-4. Track activation magnitude and co-activation count
+For each layer:
+1. Randomly sample 60 features (same 60 for all positions in that layer)
+2. Randomly sample 25% of positions in the corpus
+3. Ablate each of the 60 features at the sampled positions
+4. Measure both relative and absolute probability change
+5. Track activation magnitude and co-activation count
 
 Reports per layer:
-- Mean across all 60 random samples at all positions
+- Mean across all 60 random features at all sampled positions
 - Mean of top-K by metric value (relative change) for K=5,10,20
 - Mean of top-K by activation value for K=5,10,20
 """
@@ -65,58 +66,45 @@ def create_ablation_hook(sae, feature_id: int):
     return hook_fn
 
 
-def sample_random_features_per_position(
-    model,
-    sae,
-    layer: int,
-    hook: str,
+def sample_positions(
     data: List[torch.Tensor],
     batch_size: int,
-    num_features_to_sample: int,
-    d_sae: int,
+    sample_fraction: float,
     logger: logging.Logger
-) -> Dict[int, List[Tuple[int, int, int]]]:
+) -> List[Tuple[int, int, int]]:
     """
-    For each position, randomly sample num_features_to_sample features.
+    Randomly sample a fraction of valid positions from the corpus.
 
     Returns:
-        Dictionary mapping feature_id -> list of (batch_idx, batch_pos, seq_pos) tuples
-        where that feature was randomly sampled
+        List of (batch_idx, batch_pos, seq_pos) tuples
     """
-    logger.info(f"  Pass 1: Sampling {num_features_to_sample} random features at each position...")
+    logger.info(f"  Sampling {sample_fraction*100}% of positions...")
 
-    hook_name = f"blocks.{layer}.hook_{hook}"
-    feature_positions = defaultdict(list)
-
+    all_positions = []
     num_batches = (len(data) + batch_size - 1) // batch_size
 
-    for batch_idx in tqdm(range(num_batches), desc=f"Layer {layer} - Sampling features"):
+    # Collect all valid positions
+    for batch_idx in range(num_batches):
         batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, len(data))
         batch_tokens = data[batch_start:batch_end]
-        batch_dict = collate_batch(batch_tokens, device=model.cfg.device)
+        batch_dict = collate_batch(batch_tokens, device=torch.device("cpu"))  # Just for counting
 
-        # Get attention mask to identify valid positions
-        attention_mask = batch_dict["attention_mask"][:, :-1].bool()  # [batch, seq-1]
+        attention_mask = batch_dict["attention_mask"][:, :-1].bool()
+        for b in range(attention_mask.shape[0]):
+            for s in range(attention_mask.shape[1]):
+                if attention_mask[b, s]:
+                    all_positions.append((batch_idx, b, s))
 
-        batch_s, seq_s = attention_mask.shape
-        for b in range(batch_s):
-            for s in range(seq_s):
-                if not attention_mask[b, s]:
-                    continue
+    # Randomly sample
+    num_sample = int(len(all_positions) * sample_fraction)
+    sampled_indices = np.random.choice(len(all_positions), num_sample, replace=False)
+    sampled_positions = [all_positions[i] for i in sampled_indices]
 
-                # Randomly sample num_features_to_sample features
-                sampled_features = np.random.choice(
-                    d_sae,
-                    size=num_features_to_sample,
-                    replace=False
-                )
+    logger.info(f"    Total positions: {len(all_positions):,}")
+    logger.info(f"    Sampled positions: {len(sampled_positions):,}")
 
-                for feat_id in sampled_features:
-                    feature_positions[int(feat_id)].append((batch_idx, b, s))
-
-    logger.info(f"    Sampled across {len(feature_positions)} unique features")
-    return dict(feature_positions)
+    return sampled_positions
 
 
 def measure_ablation_effects(
@@ -124,13 +112,14 @@ def measure_ablation_effects(
     sae,
     layer: int,
     hook: str,
-    feature_positions: Dict[int, List[Tuple[int, int, int]]],
+    feature_ids: List[int],
+    sampled_positions: List[Tuple[int, int, int]],
     data: List[torch.Tensor],
     batch_size: int,
     logger: logging.Logger
 ) -> pd.DataFrame:
     """
-    Ablate each feature at positions where it was sampled and measure effects.
+    Ablate each feature at the sampled positions and measure effects.
 
     Returns:
         DataFrame with columns: feature_id, activation, co_activation_count,
@@ -140,15 +129,14 @@ def measure_ablation_effects(
 
     all_measurements = []
 
-    logger.info(f"  Pass 2: Measuring ablation effects for {len(feature_positions)} features...")
+    logger.info(f"  Measuring ablation effects for {len(feature_ids)} features at {len(sampled_positions):,} positions...")
 
-    # Group by batch for efficient processing
-    batch_to_features = defaultdict(set)
-    for feature_id, positions in feature_positions.items():
-        for batch_idx, _, _ in positions:
-            batch_to_features[batch_idx].add(feature_id)
+    # Group positions by batch
+    positions_by_batch = defaultdict(list)
+    for batch_idx, batch_pos, seq_pos in sampled_positions:
+        positions_by_batch[batch_idx].append((batch_pos, seq_pos))
 
-    for batch_idx in tqdm(sorted(batch_to_features.keys()), desc=f"Layer {layer} - Ablating"):
+    for batch_idx in tqdm(sorted(positions_by_batch.keys()), desc=f"Layer {layer} - Ablating"):
         batch_start = batch_idx * batch_size
         batch_end = min(batch_start + batch_size, len(data))
         batch_tokens = data[batch_start:batch_end]
@@ -172,8 +160,8 @@ def measure_ablation_effects(
             )
             baseline_probs = torch.softmax(baseline_logits[:, :-1, :], dim=-1)
 
-        # Ablate each feature that was sampled in this batch
-        for feature_id in batch_to_features[batch_idx]:
+        # Ablate each of the 60 random features
+        for feature_id in feature_ids:
             ablation_hook = create_ablation_hook(sae, feature_id)
 
             with torch.no_grad():
@@ -183,11 +171,8 @@ def measure_ablation_effects(
                 )
                 ablated_probs = torch.softmax(ablated_logits[:, :-1, :], dim=-1)
 
-            # Measure at positions where this feature was sampled
-            for batch_idx_check, batch_pos, seq_pos in feature_positions[feature_id]:
-                if batch_idx_check != batch_idx:
-                    continue
-
+            # Measure at sampled positions in this batch
+            for batch_pos, seq_pos in positions_by_batch[batch_idx]:
                 # Get activation and co-activation count
                 feature_act = sae_acts[batch_pos, seq_pos, feature_id].item()
                 co_activation_count = (sae_acts[batch_pos, seq_pos] > 0).sum().item()
@@ -217,8 +202,10 @@ def measure_ablation_effects(
 def main():
     parser = argparse.ArgumentParser(description="Random feature sampling ablation")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--num_sample", type=int, default=60,
-                       help="Number of features to randomly sample per position")
+    parser.add_argument("--num_features", type=int, default=60,
+                       help="Number of random features to sample per layer")
+    parser.add_argument("--position_fraction", type=float, default=0.25,
+                       help="Fraction of positions to sample (default: 0.25 = 25%)")
     args = parser.parse_args()
 
     # Load config
@@ -231,10 +218,11 @@ def main():
 
     logger = setup_logging(output_dir)
     logger.info("="*80)
-    logger.info(f"RANDOM FEATURE SAMPLING ABLATION (Sample {args.num_sample} per position)")
+    logger.info(f"RANDOM FEATURE SAMPLING ABLATION")
     logger.info("="*80)
     logger.info(f"Config: {args.config}")
-    logger.info(f"Features per position: {args.num_sample}")
+    logger.info(f"Features per layer: {args.num_features}")
+    logger.info(f"Position sampling: {args.position_fraction*100}%")
     logger.info(f"Output directory: {output_dir}")
 
     # Set device
@@ -271,6 +259,11 @@ def main():
     data, _ = corpus_loader.load_and_tokenize()
     logger.info(f"Loaded {len(data)} passages")
 
+    # Sample positions once (same positions for all layers)
+    sampled_positions = sample_positions(
+        data, config["batch_size"], args.position_fraction, logger
+    )
+
     # Process each layer
     all_results = []
 
@@ -282,16 +275,14 @@ def main():
         sae = saes[layer]
         d_sae = sae.cfg.d_sae
 
-        # Pass 1: Sample random features at each position
-        feature_positions = sample_random_features_per_position(
-            model, sae, layer, config["hook"], data,
-            config["batch_size"], args.num_sample, d_sae, logger
-        )
+        # Randomly sample features for this layer
+        random_feature_ids = np.random.choice(d_sae, size=args.num_features, replace=False).tolist()
+        logger.info(f"  Randomly selected {args.num_features} features: {random_feature_ids[:10]}... (showing first 10)")
 
-        # Pass 2: Measure ablation effects
+        # Measure ablation effects
         layer_results = measure_ablation_effects(
-            model, sae, layer, config["hook"], feature_positions,
-            data, config["batch_size"], logger
+            model, sae, layer, config["hook"], random_feature_ids,
+            sampled_positions, data, config["batch_size"], logger
         )
 
         layer_results['layer'] = layer
@@ -319,7 +310,7 @@ def main():
         logger.info(f"LAYER {layer}")
         logger.info(f"{'='*80}")
 
-        logger.info(f"\nOverall Statistics (all {args.num_sample} random samples):")
+        logger.info(f"\nOverall Statistics (all {args.num_features} random features):")
         logger.info(f"  Total measurements: {len(layer_df):,}")
         logger.info(f"  Mean relative change: {layer_df['relative_change'].mean():.4f} ({layer_df['relative_change'].mean()*100:.1f}%)")
         logger.info(f"  Mean absolute change: {layer_df['absolute_change'].mean():.6f}")
