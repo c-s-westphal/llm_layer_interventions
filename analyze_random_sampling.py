@@ -21,8 +21,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.stats as stats
 import torch
 import yaml
 from tqdm import tqdm
@@ -209,6 +211,194 @@ def measure_ablation_effects(
                 })
 
     return pd.DataFrame(all_measurements)
+
+
+def create_bar_plot(
+    results_df: pd.DataFrame,
+    metric_col: str,
+    ylabel: str,
+    title: str,
+    output_path: Path,
+    logger: logging.Logger
+):
+    """Create bar plot with confidence intervals across layers.
+
+    Args:
+        results_df: DataFrame with results for all layers
+        metric_col: Column name for the metric to plot
+        ylabel: Y-axis label
+        title: Plot title
+        output_path: Path to save the plot
+        logger: Logger instance
+    """
+    layers = []
+    means = []
+    cis = []
+
+    for layer in range(1, 12):
+        layer_df = results_df[results_df['layer'] == layer]
+        values = layer_df[metric_col].values
+
+        # Calculate mean and 95% CI
+        mean = values.mean()
+        # Use scipy.stats to calculate confidence interval
+        ci = stats.t.interval(
+            confidence=0.95,
+            df=len(values)-1,
+            loc=mean,
+            scale=stats.sem(values)
+        )
+        ci_error = mean - ci[0]  # Error bar size (symmetric)
+
+        layers.append(layer)
+        means.append(mean)
+        cis.append(ci_error)
+
+    # Create plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    bars = ax.bar(layers, means, yerr=cis, capsize=5, alpha=0.7,
+                   color='steelblue', ecolor='black', linewidth=1.5)
+
+    ax.set_xlabel('Layer', fontsize=14, fontweight='bold')
+    ax.set_ylabel(ylabel, fontsize=14, fontweight='bold')
+    ax.set_title(title, fontsize=16, fontweight='bold')
+    ax.set_xticks(layers)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"  Saved: {output_path.name}")
+
+
+def generate_all_plots(
+    results_df: pd.DataFrame,
+    output_dir: Path,
+    logger: logging.Logger
+):
+    """Generate all 28 bar plots with confidence intervals.
+
+    Args:
+        results_df: DataFrame with all results
+        output_dir: Directory to save plots
+        logger: Logger instance
+    """
+    logger.info("\n" + "="*80)
+    logger.info("GENERATING PLOTS")
+    logger.info("="*80)
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+
+    # TOP-10 TOKEN APPROACH
+    logger.info("\nTop-10 Token Approach plots:")
+
+    # Overall (all 60 features)
+    create_bar_plot(
+        results_df, 'relative_change_top10',
+        'Mean Relative Change', 'Overall: Relative Change (Top-10 Tokens)',
+        plots_dir / 'top10_overall_relative.png', logger
+    )
+    create_bar_plot(
+        results_df, 'absolute_change_top10',
+        'Mean Absolute Change', 'Overall: Absolute Change (Top-10 Tokens)',
+        plots_dir / 'top10_overall_absolute.png', logger
+    )
+
+    # Top-K by Metric Value
+    for k in [5, 10, 20]:
+        # Select top-K features per layer by metric
+        top_k_df = pd.concat([
+            results_df[results_df['layer'] == layer].nlargest(k, 'relative_change_top10')
+            for layer in range(1, 12)
+        ])
+
+        create_bar_plot(
+            top_k_df, 'relative_change_top10',
+            'Mean Relative Change', f'Top-{k} by Metric: Relative Change (Top-10 Tokens)',
+            plots_dir / f'top10_top{k}_bymetric_relative.png', logger
+        )
+        create_bar_plot(
+            top_k_df, 'absolute_change_top10',
+            'Mean Absolute Change', f'Top-{k} by Metric: Absolute Change (Top-10 Tokens)',
+            plots_dir / f'top10_top{k}_bymetric_absolute.png', logger
+        )
+
+    # Top-K by Activation Value
+    for k in [5, 10, 20]:
+        # Select top-K features per layer by activation
+        top_k_df = pd.concat([
+            results_df[results_df['layer'] == layer].nlargest(k, 'activation')
+            for layer in range(1, 12)
+        ])
+
+        create_bar_plot(
+            top_k_df, 'relative_change_top10',
+            'Mean Relative Change', f'Top-{k} by Activation: Relative Change (Top-10 Tokens)',
+            plots_dir / f'top10_top{k}_byactivation_relative.png', logger
+        )
+        create_bar_plot(
+            top_k_df, 'absolute_change_top10',
+            'Mean Absolute Change', f'Top-{k} by Activation: Absolute Change (Top-10 Tokens)',
+            plots_dir / f'top10_top{k}_byactivation_absolute.png', logger
+        )
+
+    # ALL POSITIVE TOKENS APPROACH
+    logger.info("\nAll Positive Tokens Approach plots:")
+
+    # Overall (all 60 features)
+    create_bar_plot(
+        results_df, 'relative_change_allpos',
+        'Mean Relative Change', 'Overall: Relative Change (All Positive Tokens)',
+        plots_dir / 'allpos_overall_relative.png', logger
+    )
+    create_bar_plot(
+        results_df, 'absolute_change_allpos',
+        'Mean Absolute Change', 'Overall: Absolute Change (All Positive Tokens)',
+        plots_dir / 'allpos_overall_absolute.png', logger
+    )
+
+    # Top-K by Metric Value
+    for k in [5, 10, 20]:
+        # Select top-K features per layer by metric
+        top_k_df = pd.concat([
+            results_df[results_df['layer'] == layer].nlargest(k, 'relative_change_allpos')
+            for layer in range(1, 12)
+        ])
+
+        create_bar_plot(
+            top_k_df, 'relative_change_allpos',
+            'Mean Relative Change', f'Top-{k} by Metric: Relative Change (All Positive Tokens)',
+            plots_dir / f'allpos_top{k}_bymetric_relative.png', logger
+        )
+        create_bar_plot(
+            top_k_df, 'absolute_change_allpos',
+            'Mean Absolute Change', f'Top-{k} by Metric: Absolute Change (All Positive Tokens)',
+            plots_dir / f'allpos_top{k}_bymetric_absolute.png', logger
+        )
+
+    # Top-K by Activation Value
+    for k in [5, 10, 20]:
+        # Select top-K features per layer by activation
+        top_k_df = pd.concat([
+            results_df[results_df['layer'] == layer].nlargest(k, 'activation')
+            for layer in range(1, 12)
+        ])
+
+        create_bar_plot(
+            top_k_df, 'relative_change_allpos',
+            'Mean Relative Change', f'Top-{k} by Activation: Relative Change (All Positive Tokens)',
+            plots_dir / f'allpos_top{k}_byactivation_relative.png', logger
+        )
+        create_bar_plot(
+            top_k_df, 'absolute_change_allpos',
+            'Mean Absolute Change', f'Top-{k} by Activation: Absolute Change (All Positive Tokens)',
+            plots_dir / f'allpos_top{k}_byactivation_absolute.png', logger
+        )
+
+    logger.info(f"\nGenerated 28 plots in: {plots_dir}")
 
 
 def main():
@@ -460,6 +650,9 @@ def main():
             f"    Layer {layer}: mean_rel={top_k['relative_change_allpos'].mean():.4f} ({top_k['relative_change_allpos'].mean()*100:.1f}%), "
             f"mean_abs={top_k['absolute_change_allpos'].mean():.6f}, mean_activation={top_k['activation'].mean():.2f}"
         )
+
+    # Generate all plots
+    generate_all_plots(results_df, output_dir, logger)
 
     logger.info("\nDone!")
 
