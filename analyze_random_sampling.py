@@ -404,7 +404,7 @@ def generate_all_plots(
 def main():
     parser = argparse.ArgumentParser(description="Random feature sampling ablation")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--num_features", type=int, default=60,
+    parser.add_argument("--num_features", type=int, default=200,
                        help="Number of random features to sample per layer")
     parser.add_argument("--position_fraction", type=float, default=0.25,
                        help="Fraction of positions to sample (default: 0.25 = 25%)")
