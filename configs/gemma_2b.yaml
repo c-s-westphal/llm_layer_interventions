@@ -1,0 +1,34 @@
+# Configuration for Gemma-2b (Joseph Bloom's release)
+
+# Model configuration
+model_name: "gemma-2b"
+sae_release: "gemma-2b-res-jb"
+hook: "resid_pre"
+layers: [0, 6, 10, 12, 17]  # Only these layers available
+
+# Intervention parameters
+alpha: 2.0
+alpha_sweep: [0, 0.5, 1, 2, 4]
+live_percentile: 90
+
+# Corpus configuration
+corpus_name: "wikitext2"
+max_passages: 200
+test_passages: 1500
+max_len: 256
+
+# Feature selection
+feature_source: "csv"
+neuronpedia_token: null
+top_k: 3
+
+# Computation settings
+device: "auto"
+batch_size: 16
+seed: 1234
+
+# Output configuration
+output_dir: "outputs_gemma"
+save_snippets: true
+snippet_window: 20
+num_snippet_examples: 5
