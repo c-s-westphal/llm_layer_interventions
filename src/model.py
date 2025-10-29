@@ -18,7 +18,8 @@ class ModelLoader:
         hook: str = "resid_post",
         layers: List[int] = None,
         device: torch.device = None,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        sae_id_template: str = None
     ):
         """Initialize model loader.
 
@@ -29,6 +30,7 @@ class ModelLoader:
             layers: List of layer indices to load SAEs for
             device: Device to load models on
             logger: Logger instance
+            sae_id_template: Template for SAE IDs (e.g., "layer_{layer}/width_16k/canonical")
         """
         self.model_name = model_name
         self.sae_release = sae_release
@@ -36,6 +38,7 @@ class ModelLoader:
         self.layers = layers or list(range(12))
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.logger = logger or logging.getLogger("sae_interventions")
+        self.sae_id_template = sae_id_template
 
         self.model = None
         self.saes = {}
@@ -69,15 +72,19 @@ class ModelLoader:
 
         for layer in self.layers:
             try:
-                # Construct hook point string
-                # SAE-Lens expects format like "blocks.{L}.hook_resid_pre"
-                hook_point = f"blocks.{layer}.hook_{self.hook}"
+                # Construct SAE ID
+                if self.sae_id_template:
+                    # Use template (e.g., for Gemma-Scope: "layer_{layer}/width_16k/canonical")
+                    sae_id = self.sae_id_template.format(layer=layer)
+                else:
+                    # Use default format (e.g., for GPT-2: "blocks.{L}.hook_resid_pre")
+                    sae_id = f"blocks.{layer}.hook_{self.hook}"
 
-                self.logger.info(f"Loading SAE for layer {layer} (hook_point={hook_point})")
+                self.logger.info(f"Loading SAE for layer {layer} (sae_id={sae_id})")
 
                 sae = SAE.from_pretrained(
                     release=self.sae_release,
-                    sae_id=hook_point,
+                    sae_id=sae_id,
                     device=str(self.device)
                 )
 

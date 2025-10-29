@@ -2,7 +2,8 @@
 
 # Model configuration
 model_name: "gemma-2b"
-sae_release: "gemma-scope-2b-pt-res"
+sae_release: "gemma-scope-2b-pt-res-canonical"
+sae_id_template: "layer_{layer}/width_16k/canonical"  # Gemma-Scope format
 hook: "resid_pre"
 layers: "0-25"  # Gemma-2b has 26 layers (0-25)
 

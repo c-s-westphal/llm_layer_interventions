@@ -231,11 +231,12 @@ def create_bar_plot(
         output_path: Path to save the plot
         logger: Logger instance
     """
-    layers = []
+    # Get unique layers from data
+    layer_list = sorted(results_df['layer'].unique())
     means = []
     cis = []
 
-    for layer in range(1, 12):
+    for layer in layer_list:
         layer_df = results_df[results_df['layer'] == layer]
         values = layer_df[metric_col].values
 
@@ -250,20 +251,19 @@ def create_bar_plot(
         )
         ci_error = mean - ci[0]  # Error bar size (symmetric)
 
-        layers.append(layer)
         means.append(mean)
         cis.append(ci_error)
 
     # Create plot
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    bars = ax.bar(layers, means, yerr=cis, capsize=5, alpha=0.7,
+    bars = ax.bar(layer_list, means, yerr=cis, capsize=5, alpha=0.7,
                    color='steelblue', ecolor='black', linewidth=1.5)
 
     ax.set_xlabel('Layer', fontsize=14, fontweight='bold')
     ax.set_ylabel(ylabel, fontsize=14, fontweight='bold')
     ax.set_title(title, fontsize=16, fontweight='bold')
-    ax.set_xticks(layers)
+    ax.set_xticks(layer_list)
     ax.grid(True, alpha=0.3, axis='y')
 
     plt.tight_layout()
@@ -443,13 +443,31 @@ def main():
 
     # Load model and SAEs
     logger.info("Loading model and SAEs...")
+
+    # Parse layers from config
+    if isinstance(config["layers"], str):
+        # Handle range format like "0-25"
+        if "-" in config["layers"]:
+            start, end = map(int, config["layers"].split("-"))
+            layers = list(range(start, end + 1))
+        else:
+            layers = [int(config["layers"])]
+    else:
+        # Handle list format
+        layers = config["layers"]
+
+    # Skip layer 0 if it's in the list (embedding layer typically not analyzed)
+    if 0 in layers and len(layers) > 1:
+        layers = [l for l in layers if l > 0]
+
     loader = ModelLoader(
         model_name=config["model_name"],
         sae_release=config["sae_release"],
         hook=config["hook"],
-        layers=list(range(1, 12)),  # Layers 1-11
+        layers=layers,
         device=device,
-        logger=logger
+        logger=logger,
+        sae_id_template=config.get("sae_id_template", None)
     )
 
     model = loader.load_model()
@@ -475,7 +493,7 @@ def main():
     # Process each layer
     all_results = []
 
-    for layer in range(1, 12):
+    for layer in layers:
         logger.info(f"\n{'='*80}")
         logger.info(f"LAYER {layer}")
         logger.info(f"{'='*80}")
@@ -512,7 +530,7 @@ def main():
     logger.info("="*80)
 
     # Per-layer detailed analysis
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
 
         logger.info(f"\n{'='*80}")
@@ -543,7 +561,7 @@ def main():
 
     logger.info(f"\nTop-K by Metric Value (Relative Change):")
     logger.info(f"\n  Top-5 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(5, 'relative_change_top10')
         logger.info(
@@ -552,7 +570,7 @@ def main():
         )
 
     logger.info(f"\n  Top-10 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(10, 'relative_change_top10')
         logger.info(
@@ -561,7 +579,7 @@ def main():
         )
 
     logger.info(f"\n  Top-20 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(20, 'relative_change_top10')
         logger.info(
@@ -571,7 +589,7 @@ def main():
 
     logger.info(f"\nTop-K by Activation Value:")
     logger.info(f"\n  Top-5 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(5, 'activation')
         logger.info(
@@ -580,7 +598,7 @@ def main():
         )
 
     logger.info(f"\n  Top-10 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(10, 'activation')
         logger.info(
@@ -589,7 +607,7 @@ def main():
         )
 
     logger.info(f"\n  Top-20 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(20, 'activation')
         logger.info(
@@ -603,7 +621,7 @@ def main():
 
     logger.info(f"\nTop-K by Metric Value (Relative Change):")
     logger.info(f"\n  Top-5 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(5, 'relative_change_allpos')
         logger.info(
@@ -612,7 +630,7 @@ def main():
         )
 
     logger.info(f"\n  Top-10 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(10, 'relative_change_allpos')
         logger.info(
@@ -621,7 +639,7 @@ def main():
         )
 
     logger.info(f"\n  Top-20 features per layer:")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(20, 'relative_change_allpos')
         logger.info(
@@ -631,7 +649,7 @@ def main():
 
     logger.info(f"\nTop-K by Activation Value:")
     logger.info(f"\n  Top-5 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(5, 'activation')
         logger.info(
@@ -640,7 +658,7 @@ def main():
         )
 
     logger.info(f"\n  Top-10 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(10, 'activation')
         logger.info(
@@ -649,7 +667,7 @@ def main():
         )
 
     logger.info(f"\n  Top-20 features per layer (by activation):")
-    for layer in range(1, 12):
+    for layer in layers:
         layer_df = results_df[results_df['layer'] == layer]
         top_k = layer_df.nlargest(20, 'activation')
         logger.info(

@@ -50,6 +50,10 @@ outputs/**/*.jpg
 outputs/**/*.jsonl
 *.log
 
+# Results (large CSV files)
+results/
+results/**/*.csv
+
 # Data
 data/cache/
 data/*.pt
