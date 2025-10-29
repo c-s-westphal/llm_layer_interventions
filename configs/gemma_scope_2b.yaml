@@ -28,7 +28,7 @@ top_k: 3
 
 # Computation settings
 device: "auto"
-batch_size: 16
+batch_size: 4  # Reduced from 16 for 32GB GPU
 seed: 1234
 
 # Output configuration
