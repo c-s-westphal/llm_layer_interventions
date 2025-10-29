@@ -1,7 +1,7 @@
 # Configuration for Gemma-Scope-2b SAE intervention experiments
 
 # Model configuration
-model_name: "gemma-2b"
+model_name: "google/gemma-2-2b"  # Gemma 2 series (d_model=2304)
 sae_release: "gemma-scope-2b-pt-res-canonical"
 sae_id_template: "layer_{layer}/width_16k/canonical"  # Gemma-Scope format
 hook: "resid_pre"
