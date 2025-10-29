@@ -414,6 +414,12 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
+    # Override position_fraction from config if specified
+    if "position_fraction" in config:
+        position_fraction = config["position_fraction"]
+    else:
+        position_fraction = args.position_fraction
+
     # Setup output
     output_dir = Path(config["output_dir"]) / "random_sampling"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -424,7 +430,7 @@ def main():
     logger.info("="*80)
     logger.info(f"Config: {args.config}")
     logger.info(f"Features per layer: {args.num_features}")
-    logger.info(f"Position sampling: {args.position_fraction*100}%")
+    logger.info(f"Position sampling: {position_fraction*100}%")
     logger.info(f"Output directory: {output_dir}")
 
     # Set device
@@ -463,7 +469,7 @@ def main():
 
     # Sample positions once (same positions for all layers)
     sampled_positions = sample_positions(
-        data, config["batch_size"], args.position_fraction, logger
+        data, config["batch_size"], position_fraction, logger
     )
 
     # Process each layer
