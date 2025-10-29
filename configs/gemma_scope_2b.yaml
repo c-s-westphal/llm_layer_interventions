@@ -17,6 +17,9 @@ max_passages: 200
 test_passages: 1500
 max_len: 256
 
+# Position sampling (10% for Gemma due to more layers)
+position_fraction: 0.10
+
 # Feature selection
 feature_source: "csv"
 neuronpedia_token: null
